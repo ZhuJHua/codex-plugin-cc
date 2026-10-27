@@ -64,21 +64,53 @@ function isProgressBlockTitle(line) {
   );
 }
 
-export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_LINES) {
+function readJobProgressEntries(logFile) {
   if (!logFile || !fs.existsSync(logFile)) {
     return [];
   }
 
-  const lines = fs
+  return fs
     .readFileSync(logFile, "utf8")
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
     .filter(Boolean)
     .filter((line) => line.startsWith("["))
-    .map(stripLogPrefix)
-    .filter((line) => line && !isProgressBlockTitle(line));
+    .map((line) => ({
+      message: stripLogPrefix(line),
+      timestamp: line.match(/^\[([^\]]+)\]/)?.[1] ?? null,
+      progress: /^\[[^\]]+\]\s+\[progress\]\s/.test(line)
+    }))
+    .filter((entry) => entry.message && !isProgressBlockTitle(entry.message));
+}
 
-  return lines.slice(-maxLines);
+export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_LINES) {
+  return readJobProgressEntries(logFile).slice(-maxLines).map((entry) => entry.message);
+}
+
+function currentCommandProgress(entries, now) {
+  // Modern logs mark progress explicitly, so diagnostics and log block bodies
+  // cannot introduce command events. Retain support for older unmarked logs.
+  const progress = entries.filter((entry) => entry.progress);
+  const unfinished = [];
+  for (const entry of progress.length ? progress : entries) {
+    const message = entry.message.replace(/\s+/g, " ");
+    if (message.startsWith("Running command:")) {
+      unfinished.push({ ...entry, command: message.slice("Running command:".length).trim() });
+      continue;
+    }
+    const completion = message.match(/^Command (?:completed|failed|declined):\s*(.*)$/);
+    if (!completion) continue;
+    const command = completion[1].replace(/ \(exit [^()]+\)$/, "").trim();
+    const index = unfinished.findIndex((entry) => entry.command === command);
+    if (index !== -1) unfinished.splice(index, 1);
+  }
+  const latest = unfinished.at(-1);
+  if (!latest) return null;
+  const elapsed = formatElapsedDuration(latest.timestamp, now);
+  if (!elapsed) return null;
+  const command = latest.command;
+  const shortCommand = command.length > 96 ? `${command.slice(0, 93)}...` : command;
+  return `Running command: ${shortCommand} (running ${elapsed})`;
 }
 
 function formatElapsedDuration(startValue, endValue = null) {
@@ -166,14 +198,14 @@ function inferLegacyJobPhase(job, progressPreview = []) {
 
 export function enrichJob(job, options = {}) {
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
+  const entries = ["queued", "running", "failed"].includes(job.status) ? readJobProgressEntries(job.logFile) : [];
+  const now = options.now ?? new Date().toISOString();
   const enriched = {
     ...job,
     kindLabel: getJobTypeLabel(job),
-    progressPreview:
-      job.status === "queued" || job.status === "running" || job.status === "failed"
-        ? readJobProgressPreview(job.logFile, maxProgressLines)
-        : [],
-    elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? null),
+    progressPreview: entries.slice(-maxProgressLines).map((entry) => entry.message),
+    current: job.status === "running" ? currentCommandProgress(entries, now) : null,
+    elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? now),
     duration:
       job.status === "completed" || job.status === "failed" || job.status === "cancelled"
         ? formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)

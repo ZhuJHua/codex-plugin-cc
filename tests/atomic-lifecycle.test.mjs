@@ -11,7 +11,7 @@ import { acquireThread, claimJob, markSessionEnded, readJob, reconcileJob, relea
 import { mutateJob, resolveStateDir, writeJobFile } from '../plugins/codex/scripts/lib/state.mjs';
 import { createJobProgressUpdater, runTrackedJob } from '../plugins/codex/scripts/lib/tracked-jobs.mjs';
 import { cleanupCoordination, registerTestRoot, cleanupTestProcesses } from './cleanup.mjs';
-import { initGitRepo } from './helpers.mjs';
+import { initGitRepo, requireProcessIdentity } from './helpers.mjs';
 import { processIdentity } from '../plugins/codex/scripts/lib/process-identity.mjs';
 
 function fixture(t) {
@@ -201,15 +201,17 @@ test('persisted process cleanup validates identity before signalling', async t =
   assert.match(stopOwnedProcesses({ appServerPid: child.pid }), /cannot be verified/);
   assert.match(stopOwnedProcesses({ appServerPid: child.pid, appServerIdentity: 'different-process-identity' }), /cannot be verified/);
   assert.equal(child.exitCode, null);
-  if (!identity) { t.diagnostic('OS process identity inspection is restricted; authenticated kill branch was not exercised.'); return; }
-  const original = process.kill;
-  process.kill = function(pid, signal) {
-    if (pid === child.pid && signal === 'SIGKILL') assert.equal(fs.existsSync(path.join(resolveStateDir(f.cwd), '.transaction')), false);
-    return original.call(this, pid, signal);
-  };
-  try { assert.equal(stopOwnedProcesses({ appServerPid: child.pid, appServerIdentity: identity }, 'SIGKILL'), null); }
-  finally { process.kill = original; }
-  await exited;
+  await t.test('verified process cleanup signals outside the state transaction', async t => {
+    if (!requireProcessIdentity(t)) return;
+    const original = process.kill;
+    process.kill = function(pid, signal) {
+      if (pid === child.pid && signal === 'SIGKILL') assert.equal(fs.existsSync(path.join(resolveStateDir(f.cwd), '.transaction')), false);
+      return original.call(this, pid, signal);
+    };
+    try { assert.equal(stopOwnedProcesses({ appServerPid: child.pid, appServerIdentity: identity }, 'SIGKILL'), null); }
+    finally { process.kill = original; }
+    await exited;
+  });
 });
 
 test('claim records process identity without assuming a detached worker group', t => {

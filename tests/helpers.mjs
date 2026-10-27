@@ -6,6 +6,13 @@ import process from "node:process";
 import { cleanupCoordination, registerTestRoot, cleanupTestProcesses } from "./cleanup.mjs";
 import { after } from "node:test";
 import { spawnSyncTestProcess as spawnSync } from "./cleanup.mjs";
+import { processIdentity } from "../plugins/codex/scripts/lib/process-identity.mjs";
+
+export function requireProcessIdentity(t) {
+  if (processIdentity(process.pid) !== null) return true;
+  t.skip("process identity unavailable (ps blocked by sandbox or OS inspection restricted)");
+  return false;
+}
 
 const temporaryDirectories = new Set();
 after(async () => {

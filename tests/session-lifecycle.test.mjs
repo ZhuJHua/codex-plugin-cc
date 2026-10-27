@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 
 import { processAlive } from "../plugins/codex/scripts/lib/atomic-store.mjs";
 import { processIdentity } from "../plugins/codex/scripts/lib/process-identity.mjs";
+import { requireProcessIdentity } from "./helpers.mjs";
 import { readJob, sessionHasEnded } from "../plugins/codex/scripts/lib/job-lifecycle.mjs";
 import {
   buildSingleJobSnapshot,
@@ -94,6 +95,7 @@ function runHook(input, extraEnv = {}) {
 }
 
 test("SessionEnd cancels owner jobs across working directories and retains artifacts", async t => {
+  if (!requireProcessIdentity(t)) return;
   const f = fixture(t);
   const first = f.repo("first");
   const second = f.repo("second");

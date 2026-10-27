@@ -109,15 +109,15 @@ function formatCodexResumeCommand(job) {
 
 function appendActiveJobsTable(lines, jobs) {
   lines.push("Active jobs:");
-  lines.push("| Job | Kind | Status | Phase | Elapsed | Codex Session ID | Summary | Actions |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+  lines.push("| Job | Kind | Status | Phase | Elapsed | Codex Session ID | Summary | Current | Actions |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const job of jobs) {
     const actions = [`/codex:status ${job.id}`];
     if (job.status === "queued" || job.status === "running") {
       actions.push(`/codex:cancel ${job.id}`);
     }
     lines.push(
-      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
+      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${escapeMarkdownCell(job.status === "running" ? job.current : "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
     );
   }
 }
@@ -135,6 +135,9 @@ function pushJobDetails(lines, job, options = {}) {
   }
   if (options.showElapsed && job.elapsed) {
     lines.push(`  Elapsed: ${job.elapsed}`);
+  }
+  if (job.status === "running" && job.current) {
+    lines.push(`  Current: ${job.current}`);
   }
   if (options.showDuration && job.duration) {
     lines.push(`  Duration: ${job.duration}`);

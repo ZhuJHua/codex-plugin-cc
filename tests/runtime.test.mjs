@@ -8,7 +8,7 @@ import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { initGitRepo, makeTempDir, requireProcessIdentity, run } from "./helpers.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 import { processIdentity } from "../plugins/codex/scripts/lib/process-identity.mjs";
 
@@ -1452,7 +1452,7 @@ test("status shows phases, hints, and the latest finished job", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Active jobs:/);
-  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Actions \|/);
+  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Current \| Actions \|/);
   assert.match(result.stdout, /\| review-live \| review \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/);
   assert.match(result.stdout, /`\/codex:status review-live`<br>`\/codex:cancel review-live`/);
   assert.match(result.stdout, /Live details:/);
@@ -1854,6 +1854,7 @@ test("result for a finished write-capable task returns the raw Codex final respo
 });
 
 test("cancel stops an active background job and marks it cancelled", async (t) => {
+  if (!requireProcessIdentity(t)) return;
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
@@ -2014,6 +2015,7 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
 });
 
 test("cancel with a job id can still target an active job from another Claude session", async (t) => {
+  if (!requireProcessIdentity(t)) return;
   const workspace = makeTempDir();
   const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd: workspace, detached: true, stdio: "ignore" });
   t.after(() => { try { sleeper.kill("SIGKILL"); } catch {} });
@@ -2134,6 +2136,7 @@ test("cancel sends turn interrupt to the private app-server before stopping its 
 });
 
 test("session end cancels owner work and preserves records and logs", async (t) => {
+  if (!requireProcessIdentity(t)) return;
   const repo = makeTempDir();
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
