@@ -141,3 +141,14 @@ test('fork installation identity preserves the codex command namespace', () => {
   assert.match(frontmatter(read('agents/codex-rescue.md')), /^model: haiku$/m);
   assert.match(read('commands/rescue.md'), /--network/);
 });
+
+test('observer instructions set the Bash cap and treat 124 as still running', () => {
+  for (const file of ['commands/await.md', 'commands/rescue.md', 'commands/review.md', 'commands/adversarial-review.md', 'skills/codex-cli-runtime/SKILL.md']) {
+    const source = read(file);
+    assert.match(source, /Bash tool `timeout` to `600000`/);
+    assert.match(source, /9 minutes/);
+    assert.match(source, /--timeout-ms/);
+    assert.match(source, /Exit 124 means still running: await again/);
+    assert.match(source, /never report failure or completion/);
+  }
+});

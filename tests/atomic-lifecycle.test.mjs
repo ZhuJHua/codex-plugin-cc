@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnTestProcess as spawn, spawnSyncTestProcess as spawnSync } from './cleanup.mjs';
 import { atomicJson, readJson, withFileLock } from '../plugins/codex/scripts/lib/atomic-store.mjs';
 import { acquireThread, claimJob, markSessionEnded, readJob, reconcileJob, releaseThread, requestCancellation, reserveJob, stopOwnedProcesses } from '../plugins/codex/scripts/lib/job-lifecycle.mjs';
 import { mutateJob, resolveStateDir, writeJobFile } from '../plugins/codex/scripts/lib/state.mjs';
@@ -193,7 +193,7 @@ test('reconciliation refuses to kill an unauthenticated runtime and prevents a l
 
 test('persisted process cleanup validates identity before signalling', async t => {
   const f = fixture(t);
-  const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+  const child = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { cwd: f.cwd, stdio: 'ignore' });
   const exited = new Promise(resolve => child.once('exit', resolve));
   await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
   t.after(async () => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await exited; });

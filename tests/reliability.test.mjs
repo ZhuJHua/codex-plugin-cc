@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnTestProcess as spawn, spawnSyncTestProcess as spawnSync } from './cleanup.mjs';
 import { fileURLToPath } from 'node:url';
 import { installFakeCodex, buildEnv } from './fake-codex-fixture.mjs';
 import { cleanupCoordination, registerTestRoot, cleanupTestProcesses } from './cleanup.mjs';
@@ -104,7 +104,7 @@ test('adversarial review keeps a 1000-file untracked virtual environment prompt 
   assert.doesNotMatch(prompt, /UNTRACKED_BODY_MARKER/);
 });
 
-test('task and await show concise progress and emit final output only on stdout', t => {
+test('task streams concise progress and terminal await emits only the result', t => {
   const f = fixture(t, 'with-progress');
   const result = f.cli(['task', '--write', 'implement']);
   assert.equal(result.status, 0, result.stderr);
@@ -113,9 +113,12 @@ test('task and await show concise progress and emit final output only on stdout'
     assert.equal(output.status, 0, output.stderr);
     assert.equal(output.stdout, job.rendered);
     assert.equal(output.stdout.split(job.result.rawOutput).length, 2);
-    assert.match(output.stderr, /Running command: npm test/);
-    assert.match(output.stderr, /Command completed: npm test \(exit 0\)/);
-    assert.match(output.stderr, /File changes completed: edited\.txt/);
+    if (output === result) {
+      assert.match(output.stderr, /Queued Codex Task\./);
+      assert.match(output.stderr, /Running command: npm test/);
+      assert.match(output.stderr, /Command completed: npm test \(exit 0\)/);
+      assert.match(output.stderr, /File changes completed: edited\.txt/);
+    } else assert.equal(output.stderr, '');
     assert.doesNotMatch(output.stderr, /RAW_COMMAND_OUTPUT_MARKER|RAW_PATCH_MARKER|Observed command execution|Observed file change|Assistant message|Final output|Handled the requested task/);
   }
   const json = f.cli(['await', job.id, '--json']);
@@ -207,7 +210,7 @@ test('observer death leaves worker alive, await timeout preserves job, SessionEn
   const observer = spawn(process.execPath, [script, 'task', '--json', '--full-access', 'long task'], { cwd: f.repo, env: f.env, stdio: 'ignore' });
   t.after(() => { try { observer.kill('SIGKILL'); } catch {} });
   const job = await until(() => f.jobs().find(job => job.turnId));
-  observer.kill('SIGKILL'); await pause(50);
+  observer.kill('SIGKILL'); await until(() => observer.signalCode !== null || observer.exitCode !== null);
   const timeout = f.cli(['await', job.id, '--timeout-ms', '0', '--json']);
   assert.equal(timeout.status, 124); assert.equal(parsed(timeout).waitTimedOut, true);
   const end = spawnSync(process.execPath, [hook, 'SessionEnd'], { cwd: f.repo, env: f.env, input: JSON.stringify({ session_id: f.env.CODEX_COMPANION_SESSION_ID, cwd: f.repo }), encoding: 'utf8', timeout: 10000 });
@@ -224,6 +227,7 @@ test('foreground observer can disappear and the result is still retrievable', as
   const observer = spawn(process.execPath, [script, 'task', '--json', 'inspect'], { cwd: f.repo, env: f.env, stdio: 'ignore' });
   t.after(() => { try { observer.kill('SIGKILL'); } catch {} });
   const job = await until(() => f.jobs().find(job => job.turnId)); observer.kill('SIGKILL');
+  await until(() => observer.signalCode !== null || observer.exitCode !== null);
   const result = f.cli(['await', job.id, '--json']);
   assert.equal(result.status, 0, result.stderr); assert.equal(parsed(result).meta.jobStatus, 'completed');
 });
@@ -428,4 +432,92 @@ test('status uses a neutral task label and running phase once the turn starts', 
   assert.match(conflict.error.message, new RegExp(`/codex:cancel ${job.id}`));
   assert.match(conflict.error.message, /CLI await:.*'await'/);
   assert.equal(f.cli(['cancel', job.id, '--json']).status, 0);
+});
+
+test('explicit job IDs resolve across workspaces for status, result, await and cancel', async t => {
+  const f = fixture(t, 'interruptible-slow-task');
+  const origin = path.join(f.root, 'origin'); fs.mkdirSync(origin);
+  const launch = parsed(f.cli(['task', '--cwd', f.repo, '--background', '--json', 'inspect'], { cwd: origin }));
+  const job = await until(() => f.jobs().find(job => job.id === launch.jobId && job.turnId));
+  const fromOrigin = args => f.cli(args, { cwd: origin });
+  const status = parsed(fromOrigin(['status', job.id, '--json']));
+  assert.equal(fs.realpathSync(status.workspaceRoot), fs.realpathSync(f.repo));
+  assert.equal(status.job.id, job.id);
+  assert.equal(fs.realpathSync(status.meta.resultFile), fs.realpathSync(path.join(path.dirname(job.logFile), `${job.id}.json`)));
+  const list = parsed(fromOrigin(['status', '--all', '--json']));
+  assert.equal(list.running.length, 0);
+  assert.equal(list.latestFinished, null);
+  assert.equal(fromOrigin(['result']).status, 1);
+  assert.equal(fromOrigin(['cancel']).status, 1);
+  for (const command of ['status', 'result', 'await', 'cancel']) {
+    const prefix = fromOrigin([command, job.id.slice(0, -2)]);
+    assert.equal(prefix.status, 1, `${command}: ${prefix.stderr}`);
+    assert.match(prefix.stderr, /No job found/);
+  }
+  assert.equal(fromOrigin(['await', job.id, '--timeout-ms', '0']).status, 124);
+  assert.equal(fromOrigin(['cancel', job.id, '--json']).status, 0);
+  const result = parsed(fromOrigin(['result', job.id, '--json']));
+  assert.equal(result.job.status, 'cancelled');
+  const collected = fromOrigin(['await', job.id, '--json']);
+  assert.equal(collected.status, 1);
+  assert.equal(parsed(collected).meta.jobId, job.id);
+  assert.doesNotMatch(collected.stderr, /Queued|Turn started|Starting Codex/);
+  // Waiting and cancellation never created an origin copy of the job.
+  assert.equal(parsed(fromOrigin(['status', '--all', '--json'])).running.length, 0);
+});
+
+test('await bounds existing progress and suppresses all replay for terminal failures', async t => {
+  const f = fixture(t, 'interruptible-slow-task');
+  const launch = parsed(f.cli(['task', '--background', '--json', 'inspect']));
+  const job = await until(() => f.jobs().find(job => job.id === launch.jobId && job.turnId));
+  await until(() => fs.readFileSync(job.logFile, 'utf8').includes('[progress] Turn started'));
+  fs.appendFileSync(job.logFile, Array.from({ length: 50 }, (_, i) => `[2026-10-27] [progress] replay-${i}\n`).join(''));
+  const attached = f.cli(['await', job.id, '--timeout-ms', '0']);
+  assert.equal(attached.status, 124, attached.stderr);
+  assert.match(attached.stderr, /… \d+ earlier progress lines in /);
+  assert.equal(attached.stderr.match(/replay-/g).length, 20);
+  assert.doesNotMatch(attached.stderr, /replay-0\n/);
+  assert.equal(f.cli(['cancel', job.id]).status, 0);
+  const terminal = f.cli(['await', job.id]);
+  assert.equal(terminal.status, 1);
+  assert.doesNotMatch(terminal.stderr, /replay-|earlier progress|Queued/);
+});
+
+test('foreground task and both reviews honor observer timeout without cancelling work', async t => {
+  for (const command of ['task', 'review', 'adversarial-review']) await t.test(command, async t => {
+    const f = fixture(t, 'interruptible-slow-task');
+    const args = [command, '--timeout-ms', '100'];
+    if (command === 'task') args.push('inspect');
+    const result = f.cli(args);
+    assert.equal(result.status, 124, result.stderr);
+    const job = f.jobs()[0];
+    assert.equal(result.stdout, `Job ${job.id} is still running in the background. Collect it with /codex:await ${job.id}.\n`);
+    assert.ok(['queued', 'running'].includes(job.status));
+    assert.equal(job.cancelRequestedAt, undefined);
+    assert.match(result.stderr, /Queued Codex/);
+    const collected = f.cli(['await', job.id, '--timeout-ms', '15000']);
+    assert.equal(collected.status, 0, collected.stderr);
+  });
+});
+
+test('default foreground and await observers stop after nine minutes of simulated time', async t => {
+  for (const command of ['task', 'review', 'adversarial-review', 'await']) await t.test(command, t => {
+    const f = fixture(t, 'interruptible-slow-task');
+    const clock = path.join(f.root, 'observer-clock.mjs');
+    fs.writeFileSync(clock, `const now = Date.now; let ticks = 0;
+      Date.now = () => now() + (new Error().stack.split('\\n')[2]?.includes('at waitForJob (') ? ticks++ * 540001 : 0);`);
+    let args = [command];
+    if (command === 'await') {
+      const launch = parsed(f.cli(['task', '--background', '--json', 'inspect']));
+      args.push(launch.jobId);
+    } else if (command === 'task') args.push('inspect');
+    const result = f.cli(args, { env: { ...f.env, NODE_OPTIONS: `--import=${clock}` }, timeout: 10000 });
+    assert.equal(result.status, 124, result.stderr);
+    const job = f.jobs()[0];
+    assert.ok(['queued', 'running'].includes(job.status));
+    assert.equal(job.cancelRequestedAt, undefined);
+    assert.match(result.stdout, /still (?:queued|running)/);
+    assert.ok(result.stdout.includes(`/codex:await ${job.id}`));
+    assert.equal(f.cli(['cancel', job.id]).status, 0);
+  });
 });

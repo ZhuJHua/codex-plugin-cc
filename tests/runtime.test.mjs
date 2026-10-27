@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawnTestProcess as spawn } from "./cleanup.mjs";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 

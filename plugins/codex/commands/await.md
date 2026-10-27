@@ -14,4 +14,6 @@ Entry-point template only: Claude substitutes `$ARGUMENTS` in Markdown before Ba
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" await --raw-args "$ARGUMENTS"
 ```
 
+Set Bash tool `timeout` to `600000`. Observers default to 9 minutes; forward selected `--timeout-ms`. Exit 124 means still running: await again when the result is needed, never report failure or completion.
+
 Return the terminal result and exit status unchanged. Exit 124 means only that this wait timed out: the job continues running. Report its job ID and the await/status/result commands; do not cancel it or claim completion because the wait ended. Preserve actionable stderr if invocation fails.

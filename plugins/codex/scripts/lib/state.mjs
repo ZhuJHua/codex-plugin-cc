@@ -193,6 +193,26 @@ export function readJobFile(jobFile) {
   return job;
 }
 
+export function findJobWorkspace(cwd, jobId) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const localFile = resolveJobFile(workspaceRoot, jobId);
+  if (fs.existsSync(localFile)) return { workspaceRoot, job: readJobFile(localFile) };
+  const root = resolveStateRoot();
+  if (!fs.existsSync(root)) return null;
+  const matches = [];
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const file = path.join(root, entry.name, JOBS_DIR_NAME, `${jobId}.json`);
+    if (file === localFile || !fs.existsSync(file)) continue;
+    const job = readJobFile(file);
+    if (job?.id === jobId && job.workspaceRoot && path.join(resolveJobsDir(job.workspaceRoot), `${jobId}.json`) === file) {
+      matches.push({ workspaceRoot: job.workspaceRoot, job });
+    }
+  }
+  if (matches.length > 1) throw new Error(`Job ID "${jobId}" is ambiguous across workspaces. Pass --cwd to select its workspace.`);
+  return matches[0] ?? null;
+}
+
 function removeJobFile(jobFile) {
   if (fs.existsSync(jobFile)) {
     fs.unlinkSync(jobFile);

@@ -124,3 +124,23 @@ test('malformed state and job structures fail explicitly instead of clearing his
   fs.writeFileSync(resolveJobFile(workspace, 'broken'), 'null');
   assert.throws(() => listJobs(workspace), /Invalid job structure/);
 });
+
+test('cross-workspace ID lookup rejects collisions, ignores unrelated files and stays in plugin data', async () => {
+  const { findJobWorkspace, writeJobFile } = await import('../plugins/codex/scripts/lib/state.mjs');
+  const origin = makeTempDir(), first = makeTempDir(), second = makeTempDir();
+  const id = `lookup-${path.basename(origin)}`;
+  writeJobFile(first, id, { id, workspaceRoot: first, status: 'completed' });
+  fs.writeFileSync(resolveJobFile(first, 'unrelated'), 'invalid JSON must not be read');
+  try {
+    assert.equal(fs.realpathSync(findJobWorkspace(origin, id).workspaceRoot), fs.realpathSync(first));
+    assert.equal(findJobWorkspace(origin, id.slice(0, -1)), null);
+    assert.throws(() => findJobWorkspace(origin, '../escape'), /Invalid job ID/);
+    writeJobFile(second, id, { id, workspaceRoot: second, status: 'completed' });
+    assert.throws(() => findJobWorkspace(origin, id), /ambiguous across workspaces/);
+    assert.equal(fs.realpathSync(findJobWorkspace(first, id).workspaceRoot), fs.realpathSync(first));
+    const previous = process.env.CLAUDE_PLUGIN_DATA;
+    process.env.CLAUDE_PLUGIN_DATA = makeTempDir();
+    try { assert.equal(findJobWorkspace(origin, id), null); }
+    finally { process.env.CLAUDE_PLUGIN_DATA = previous; }
+  } finally { fs.rmSync(resolveJobFile(first, 'unrelated')); }
+});

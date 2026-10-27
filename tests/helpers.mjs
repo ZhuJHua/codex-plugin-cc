@@ -5,7 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { cleanupCoordination, registerTestRoot, cleanupTestProcesses } from "./cleanup.mjs";
 import { after } from "node:test";
-import { spawnSync } from "node:child_process";
+import { spawnSyncTestProcess as spawnSync } from "./cleanup.mjs";
 
 const temporaryDirectories = new Set();
 after(async () => {

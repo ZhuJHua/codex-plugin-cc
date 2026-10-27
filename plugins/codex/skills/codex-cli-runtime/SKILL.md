@@ -24,6 +24,7 @@ Claude substitutes this path in plugin Markdown when it loads. It is not a shell
 - For authorized implementation, add `--write`; diagnosis, research, planning, or explicitly read-only requests omit it. Write capability does not authorize scope expansion.
 - Forward `--network` only when explicitly selected. It implies workspace-write and requests network access per thread/turn; writes outside allowed roots remain restricted. It cannot be combined with `--full-access`, and must not be added automatically after a failure.
 - Forward `--full-access` only when explicitly supplied before task text for this invocation. It implies write access and disables the Codex sandbox, permitting network access and writes outside the repository without approval prompts. Never infer it from earlier work or add it after a failure. A mention inside task text stays text. Report incompatible resumed permissions and the `--fresh` option instead of escalating.
+- Set Bash tool `timeout` to `600000` for foreground task/review/adversarial-review and await calls. Observers default to 9 minutes; forward selected `--timeout-ms`. Exit 124 means still running: await again when needed, never report failure or completion.
 - Wait by default; `--wait` is an explicit equivalent. Forward selected `--background` to the companion. The runner creates its own private detached worker, so do not also wrap the command in a Claude background shell.
 
 ## Return

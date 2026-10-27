@@ -1,7 +1,7 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { findJobWorkspace, getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { reconcileJob } from "./job-lifecycle.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
@@ -246,8 +246,9 @@ export function buildStatusSnapshot(cwd, options = {}) {
 }
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listReconciledJobs(workspaceRoot));
+  const exact = reference ? findJobWorkspace(cwd, reference) : null;
+  const workspaceRoot = exact?.workspaceRoot ?? resolveWorkspaceRoot(cwd);
+  const jobs = exact ? [reconcileJob(workspaceRoot, exact.job)] : sortJobsNewestFirst(listReconciledJobs(workspaceRoot));
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
@@ -260,8 +261,9 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 }
 
 export function resolveResultJob(cwd, reference) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const reconciled = listReconciledJobs(workspaceRoot);
+  const exact = reference ? findJobWorkspace(cwd, reference) : null;
+  const workspaceRoot = exact?.workspaceRoot ?? resolveWorkspaceRoot(cwd);
+  const reconciled = exact ? [reconcileJob(workspaceRoot, exact.job)] : listReconciledJobs(workspaceRoot);
   const jobs = sortJobsNewestFirst(reference ? reconciled : filterJobsForCurrentSession(reconciled));
   const finished = job => job.status === "completed" || job.status === "failed" || job.status === "cancelled";
   const selected = reference ? matchJobReference(jobs, reference) : matchJobReference(jobs, null, finished);
@@ -283,8 +285,9 @@ export function resolveResultJob(cwd, reference) {
 }
 
 export function resolveCancelableJob(cwd, reference, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listReconciledJobs(workspaceRoot));
+  const exact = reference ? findJobWorkspace(cwd, reference) : null;
+  const workspaceRoot = exact?.workspaceRoot ?? resolveWorkspaceRoot(cwd);
+  const jobs = exact ? [reconcileJob(workspaceRoot, exact.job)] : sortJobsNewestFirst(listReconciledJobs(workspaceRoot));
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {

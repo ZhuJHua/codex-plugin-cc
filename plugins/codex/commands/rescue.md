@@ -1,6 +1,6 @@
 ---
 description: Run a Codex task or follow-up, directly from the current Claude session
-argument-hint: "[--background|--wait] [--network|--full-access] [--resume|--fresh] [--model <model|spark>] [--effort <effort>] [request]"
+argument-hint: "[--background|--wait] [--timeout-ms <ms>] [--network|--full-access] [--resume|--fresh] [--model <model|spark>] [--effort <effort>] [request]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -38,5 +38,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate -
 Keep `Agent(subagent_type: "codex:codex-rescue")` as a compatibility option for independent parallel tasks or useful context isolation. Include the complete task and applicable controls in its prompt. It invokes the same runner and follows the same permission, wait, and result rules as the direct path. Keep this command inline; do not use `context: fork`, call `Skill(codex:codex-rescue)`, or recursively invoke `Skill(codex:rescue)`.
 
 ## Results
+
+Set Bash tool `timeout` to `600000`. Observers default to 9 minutes; forward selected `--timeout-ms`. Exit 124 means still running: await again when the result is needed, never report failure or completion.
 
 Return companion output unchanged, preserving job IDs, result/log paths, and recovery commands. A background launch or an interrupted observer is not completion. When the current workflow needs the result, use `/codex:await <job-id>`; otherwise report the launch and continue independent work. Preserve actual failure output, including actionable stderr. Direct missing setup/authentication to `/codex:setup`.

@@ -1,6 +1,6 @@
 ---
 description: Challenge a change and its design assumptions using Codex
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <model|spark>] [--effort <effort>] [focus ...]'
+argument-hint: '[--wait|--background] [--timeout-ms <ms>] [--base <ref>] [--scope auto|working-tree|branch] [--model <model|spark>] [--effort <effort>] [focus ...]'
 allowed-tools: Bash(node:*)
 ---
 
@@ -20,5 +20,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review --ra
 ```
 
 Wait by default, including with `--wait`. Forward `--background` only when selected; the runner owns detaching its worker. Do not wrap the companion in a second Claude background shell or infer the mode from task size.
+
+Set Bash tool `timeout` to `600000`. Observers default to 9 minutes; forward selected `--timeout-ms`. Exit 124 means still running: await again when the result is needed, never report failure or completion.
 
 Return stdout unchanged and preserve actionable stderr on failure. A launch report is not a completed review. If the workflow needs a background result, use `/codex:await <job-id>`; never fabricate findings or claim success from the launching process exiting.

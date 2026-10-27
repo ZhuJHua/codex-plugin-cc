@@ -2,7 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { sanitizeStderr } from "./lib/diagnostics.mjs";
-import { StringDecoder } from "node:string_decoder";
+import { createJobProgressReader, DEFAULT_OBSERVER_TIMEOUT_MS } from "./lib/job-observer.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -84,9 +84,9 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write|--network|--full-access] [--thread <id>|--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <effort>] [--job-timeout-ms <ms>] [--raw-args <string>] [prompt]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--timeout-ms <ms>] [--base <ref>] [--scope <auto|working-tree|branch>]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--timeout-ms <ms>] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs task [--background] [--write|--network|--full-access] [--thread <id>|--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <effort>] [--timeout-ms <ms>] [--job-timeout-ms <ms>] [--raw-args <string>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -687,34 +687,11 @@ function positiveDuration(value, name, allowZero = false) {
 
 async function observeJob(cwd, id, options = {}) {
   activeJob = readJob(cwd, id);
-  let offset = 0;
-  let pendingLog = "";
-  const decoder = new StringDecoder("utf8");
+  const progress = createJobProgressReader({ replayLimit: options.foreground ? Infinity : 20 });
+  const replay = options.foreground || !terminalJob(activeJob);
   const result = await waitForJob(cwd, id, {
-    timeoutMs: options.timeoutMs,
-    onUpdate(job) {
-      if (!job.logFile || !fs.existsSync(job.logFile)) return;
-      const size = fs.statSync(job.logFile).size;
-      if (size < offset) offset = 0;
-      if (size > offset && !process.stderr.destroyed) {
-        const fd = fs.openSync(job.logFile, "r");
-        try {
-          const chunk = Buffer.alloc(Math.min(65536, size - offset));
-          while (offset < size) {
-            const bytes = fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - offset), offset);
-            if (!bytes) break;
-            pendingLog += decoder.write(chunk.subarray(0, bytes));
-            const lines = pendingLog.split("\n");
-            pendingLog = lines.pop();
-            for (const line of lines) {
-              const progress = line.match(/^(\[[^\]]+\]) \[progress\] (.*)$/);
-              if (progress) process.stderr.write(`${progress[1]} ${progress[2]}\n`);
-            }
-            offset += bytes;
-          }
-        } finally { fs.closeSync(fd); }
-      }
-    }
+    timeoutMs: options.timeoutMs ?? DEFAULT_OBSERVER_TIMEOUT_MS,
+    onUpdate: replay ? progress : null
   });
   const { job, timedOut } = result;
   const payload = { ...(job.result ?? { status: job.status === "completed" ? 0 : 1, threadId: job.threadId ?? null, rawOutput: job.partialOutput ?? "", error: job.errorMessage ? { message: job.errorMessage } : null }), meta: jobMeta(job) };
@@ -723,7 +700,10 @@ async function observeJob(cwd, id, options = {}) {
     if (payload.codex) payload.codex = { ...payload.codex, status: 1 };
   }
   if (timedOut) payload.waitTimedOut = true;
-  outputCommandResult(payload, timedOut ? `Job ${id} is still ${job.status}. Resume waiting with /codex:await ${id} or check /codex:status ${id}.\n` : ["failed", "cancelled"].includes(job.status) ? renderStoredJobResult(job, job) : job.rendered || `${job.errorMessage ?? "No final output recorded."}\n`, options.json);
+  const waiting = options.foreground
+    ? `Job ${id} is still running in the background. Collect it with /codex:await ${id}.\n`
+    : `Job ${id} is still ${job.status}. Resume waiting with /codex:await ${id} or check /codex:status ${id}.\n`;
+  outputCommandResult(payload, timedOut ? waiting : ["failed", "cancelled"].includes(job.status) ? renderStoredJobResult(job, job) : job.rendered || `${job.errorMessage ?? "No final output recorded."}\n`, options.json);
   if (job.status === "failed" || job.status === "cancelled") process.stderr.write(`${job.errorMessage ?? job.status}\n`);
   process.exitCode = timedOut ? 124 : job.status === "completed" ? 0 : 1;
 }
@@ -734,7 +714,7 @@ async function dispatchJob(job, request, options) {
   job.requested = { model: request.requestedModel ?? request.model ?? null, effort: request.requestedEffort ?? request.effort ?? null, sandbox: job.sandbox ?? "read-only", networkAccess: request.network || request.fullAccess ? true : null, approvalPolicy: "never" };
   const reserved = reserveJob(job, request);
   activeJob = reserved;
-  appendLogLine(job.logFile, `Queued ${job.title}.`);
+  appendLogLine(job.logFile, `[progress] Queued ${job.title}.`);
   try {
     if (request.resumeThreadId) acquireThread(reserved, request.resumeThreadId);
     const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "task-worker", "--cwd", request.cwd, "--job-id", job.id], {
@@ -753,15 +733,16 @@ async function dispatchJob(job, request, options) {
   if (options.background) {
     const payload = { jobId: job.id, status: current.status, title: job.title, summary: job.summary, sandbox: job.sandbox, logFile: job.logFile, meta: jobMeta(current) };
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
-  } else await observeJob(job.workspaceRoot, job.id, options);
+  } else await observeJob(job.workspaceRoot, job.id, { ...options, foreground: true, timeoutMs: options["timeout-ms"] });
 }
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "effort", "cwd", "job-timeout-ms"],
+    valueOptions: ["base", "scope", "model", "effort", "cwd", "job-timeout-ms", "timeout-ms"],
     booleanOptions: ["json", "background", "wait"], stopAtPositional: true, aliasMap: { m: "model" }
   });
   jsonRequested = Boolean(options.json);
+  options["timeout-ms"] = positiveDuration(options["timeout-ms"], "--timeout-ms", true);
   if (options.background && options.wait) throw new Error("Choose --wait or --background.");
   if (config.reviewName === "Review" && options.effort != null) throw new Error("Native review does not support --effort. Use adversarial-review --effort instead.");
   const cwd = resolveCommandCwd(options);
@@ -783,11 +764,12 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file", "thread", "job-timeout-ms"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "thread", "job-timeout-ms", "timeout-ms"],
     booleanOptions: ["json", "write", "full-access", "network", "resume-last", "resume", "fresh", "background", "wait"],
     stopAtPositional: true, aliasMap: { m: "model" }
   });
   jsonRequested = Boolean(options.json);
+  options["timeout-ms"] = positiveDuration(options["timeout-ms"], "--timeout-ms", true);
   if (options.background && options.wait) throw new Error("Choose --wait or --background.");
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -897,7 +879,8 @@ async function handleAwait(argv) {
   const { options, positionals } = parseCommandInput(argv, { valueOptions: ["cwd", "timeout-ms"], booleanOptions: ["json"] });
   jsonRequested = Boolean(options.json);
   if (positionals.length !== 1) throw new Error("await requires exactly one job ID.");
-  await observeJob(resolveCommandWorkspace(options), positionals[0], { json: options.json, timeoutMs: positiveDuration(options["timeout-ms"], "--timeout-ms", true) });
+  const { workspaceRoot, job } = buildSingleJobSnapshot(resolveCommandWorkspace(options), positionals[0]);
+  await observeJob(workspaceRoot, job.id, { json: options.json, timeoutMs: positiveDuration(options["timeout-ms"], "--timeout-ms", true) });
 }
 
 async function handleStatus(argv) {

@@ -102,7 +102,8 @@ function runStopReview(cwd, input = {}) {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", "--job-timeout-ms", String(STOP_REVIEW_TIMEOUT_MS - 10000), prompt], {
+  const jobTimeoutMs = String(STOP_REVIEW_TIMEOUT_MS - 10000);
+  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", "--timeout-ms", jobTimeoutMs, "--job-timeout-ms", jobTimeoutMs, prompt], {
     cwd,
     env: childEnv,
     encoding: "utf8",
@@ -117,6 +118,19 @@ function runStopReview(cwd, input = {}) {
     };
   }
 
+  let payload;
+  let parseError = null;
+  try { payload = JSON.parse(result.stdout); } catch (error) { parseError = error; }
+  if (result.status === 124 || payload?.waitTimedOut) {
+    const jobId = payload?.meta?.jobId ?? payload?.jobId;
+    return {
+      ok: false,
+      reason: jobId
+        ? `The stop-time Codex review task ${jobId} is still running. Collect it with /codex:await ${jobId}.`
+        : "The stop-time Codex review task is still running. Check /codex:status for its job ID, then collect it with /codex:await <job-id>."
+    };
+  }
+
   if (result.status !== 0) {
     const detail = String(result.stderr || result.stdout || "").trim();
     return {
@@ -127,16 +141,14 @@ function runStopReview(cwd, input = {}) {
     };
   }
 
-  try {
-    const payload = JSON.parse(result.stdout);
-    return parseStopReviewOutput(payload?.rawOutput);
-  } catch {
+  if (parseError) {
     return {
       ok: false,
       reason:
         "The stop-time Codex review task returned invalid JSON. Run /codex:review --wait manually or bypass the gate."
     };
   }
+  return parseStopReviewOutput(payload?.rawOutput);
 }
 
 function main() {

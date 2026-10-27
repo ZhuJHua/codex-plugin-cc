@@ -5,6 +5,7 @@ import { CodexAppServerClient } from '../plugins/codex/scripts/lib/app-server.mj
 import { processAlive } from '../plugins/codex/scripts/lib/atomic-store.mjs';
 import { makeTempDir } from './helpers.mjs';
 import { installFakeCodex, buildEnv } from './fake-codex-fixture.mjs';
+import { registerTestProcess } from './cleanup.mjs';
 
 function fixture(behavior) {
   const cwd = makeTempDir(), bin = makeTempDir();
@@ -41,9 +42,9 @@ test('rollout thread-not-found diagnostics are suppressed only after initiated s
 test('default clients own separate process groups and closing one preserves the other', async t => {
   const f = fixture();
   let firstProcess, secondProcess;
-  const first = await CodexAppServerClient.connect(f.cwd, { env: f.env, onProcess: value => { firstProcess = value; } });
+  const first = await CodexAppServerClient.connect(f.cwd, { env: f.env, onProcess: value => { firstProcess = value; registerTestProcess(value.appServerPid, value.appServerPgid, f.cwd); } });
   t.after(() => first.close());
-  const second = await CodexAppServerClient.connect(f.cwd, { env: f.env, onProcess: value => { secondProcess = value; } });
+  const second = await CodexAppServerClient.connect(f.cwd, { env: f.env, onProcess: value => { secondProcess = value; registerTestProcess(value.appServerPid, value.appServerPgid, f.cwd); } });
   t.after(() => second.close());
   assert.notEqual(firstProcess.appServerPid, secondProcess.appServerPid);
   if (process.platform !== 'win32') {
@@ -68,6 +69,7 @@ test('default client cancellation cleans up an app-server awaiting initializatio
     env: f.env, signal: controller.signal,
     onProcess(value) {
       pid = value.appServerPid;
+      registerTestProcess(value.appServerPid, value.appServerPgid, f.cwd);
       timer ??= setTimeout(() => controller.abort(new Error('cancel initialization')), 100);
     }
   }), /cancel initialization/);
