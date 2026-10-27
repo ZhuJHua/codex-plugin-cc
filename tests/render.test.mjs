@@ -2,7 +2,7 @@ import "./environment.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
+import { renderJobStatusReport, renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(
@@ -26,6 +26,20 @@ test("renderReviewResult degrades gracefully when JSON is missing required revie
   assert.match(output, /Codex returned JSON with an unexpected review shape\./);
   assert.match(output, /Missing array `findings`\./);
   assert.match(output, /Raw final message:/);
+});
+
+test("job status suggests reviews only for completed tasks that changed files", () => {
+  for (const status of ["queued", "running", "cancelled", "failed", "completed"]) {
+    for (const touchedFiles of [[], ["changed.txt"]]) {
+      const output = renderJobStatusReport({ id: "task-status", status, jobClass: "task", write: true, result: { touchedFiles } });
+      if (status === "completed" && touchedFiles.length) {
+        assert.match(output, /Review changes: \/codex:review --wait/);
+        assert.match(output, /Stricter review: \/codex:adversarial-review --wait/);
+      } else {
+        assert.doesNotMatch(output, /Review changes:|Stricter review:/);
+      }
+    }
+  }
 });
 
 test("renderStoredJobResult prefers rendered output for structured review jobs", () => {

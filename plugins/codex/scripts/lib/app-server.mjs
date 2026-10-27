@@ -59,6 +59,7 @@ export class CodexAppServerClient {
     this.nextId = 1;
     this.stderr = "";
     this.closed = false;
+    this.shutdownRequested = false;
     this.exitError = null;
     /** @type {AppServerNotificationHandler | null} */
     this.notificationHandler = null;
@@ -83,6 +84,7 @@ export class CodexAppServerClient {
     if (this.closed) {
       throw new Error("codex app-server client is closed.");
     }
+    if (method === "turn/interrupt") this.shutdownRequested = true;
 
     const id = this.nextId;
     this.nextId += 1;
@@ -172,6 +174,12 @@ export class CodexAppServerClient {
     this.resolveExit(undefined);
   }
 
+  handleStderrLine(line) {
+    const shuttingDown = this.shutdownRequested || this.options.signal?.aborted;
+    if (shuttingDown && /\bERROR\s+codex_core::session:\s+failed to record rollout items:\s+thread \S+ not found$/.test(sanitizeStderr(line))) return;
+    this.stderr += `${line}\n`;
+  }
+
   async initialize() {
     this.proc = spawn("codex", ["app-server"], {
       cwd: this.cwd,
@@ -194,9 +202,8 @@ export class CodexAppServerClient {
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
 
-    this.proc.stderr.on("data", (chunk) => {
-      this.stderr += chunk;
-    });
+    this.stderrReadline = readline.createInterface({ input: this.proc.stderr });
+    this.stderrReadline.on("line", line => this.handleStderrLine(line));
 
     this.proc.on("error", (error) => {
       this.handleExit(error);
@@ -239,6 +246,7 @@ export class CodexAppServerClient {
     }
 
     this.closed = true;
+    this.shutdownRequested = true;
 
     if (this.proc?.pid) {
       const pid = this.proc.pid;

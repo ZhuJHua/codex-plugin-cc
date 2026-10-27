@@ -103,7 +103,7 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
     if (stderr && stderrMessage && !process.stderr.destroyed) {
       try { process.stderr.write(`[codex] ${stderrMessage}\n`); } catch {}
     }
-    appendLogLine(logFile, event.message);
+    appendLogLine(logFile, stderrMessage ? `[progress] ${stderrMessage}` : event.message);
     appendLogBlock(logFile, event.logTitle, event.logBody);
   };
 }

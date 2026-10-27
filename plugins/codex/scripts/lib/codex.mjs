@@ -203,9 +203,10 @@ function emitLogEvent(onProgress, options = {}) {
   }
 
   onProgress({
+    ...options,
     message: options.message ?? "",
     phase: options.phase ?? null,
-    stderrMessage: options.stderrMessage ?? null,
+    stderrMessage: options.stderrMessage ?? "",
     logTitle: options.logTitle ?? null,
     logBody: options.logBody ?? null
   });
@@ -277,7 +278,7 @@ function describeCompletedItem(state, item) {
       };
     }
     case "fileChange":
-      return { message: `File changes ${item.status}.`, phase: "editing" };
+      return { message: `File changes ${item.status}: ${(item.changes ?? []).map(change => change.path).join(", ")}`, phase: "editing" };
     case "mcpToolCall":
       return { message: `Tool ${item.server}/${item.tool} ${item.status}.`, phase: "investigating" };
     case "dynamicToolCall":

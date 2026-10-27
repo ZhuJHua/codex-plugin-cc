@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { installFakeCodex, buildEnv } from './fake-codex-fixture.mjs';
 import { cleanupCoordination, registerTestRoot, cleanupTestProcesses } from './cleanup.mjs';
 import { initGitRepo } from './helpers.mjs';
+import { recoveryCommand } from '../plugins/codex/scripts/lib/recovery.mjs';
 
 const script = fileURLToPath(new URL('../plugins/codex/scripts/codex-companion.mjs', import.meta.url));
 const hook = fileURLToPath(new URL('../plugins/codex/scripts/session-lifecycle-hook.mjs', import.meta.url));
@@ -53,6 +54,100 @@ function fixture(t, behavior = 'review-ok') {
   return { root, repo, bin, env, jobs, cli, state: () => JSON.parse(fs.readFileSync(path.join(bin, 'fake-codex-state.json'), 'utf8')) };
 }
 const parsed = result => { assert.ok(result.stdout.trim(), result.stderr); return JSON.parse(result.stdout); };
+
+test('recovery prefers requested model and effort before thread defaults', () => {
+  const base = { workspaceRoot: '/repo', threadId: 'thread-recovery', resolved: { model: 'default-model', effort: 'high' } };
+  for (const request of [
+    { model: 'chosen-model', effort: 'medium' },
+    { requestedModel: 'chosen-model', requestedEffort: 'medium' }
+  ]) {
+    const command = recoveryCommand({ ...base, request });
+    assert.match(command, /'--model' 'chosen-model'/);
+    assert.match(command, /'--effort' 'medium'/);
+  }
+  const stored = recoveryCommand({ ...base, requested: { model: 'chosen-model', effort: 'medium' } });
+  assert.match(stored, /'--model' 'chosen-model'/);
+  assert.match(stored, /'--effort' 'medium'/);
+  const fallback = recoveryCommand(base);
+  assert.match(fallback, /'--model' 'default-model'/);
+  assert.match(fallback, /'--effort' 'high'/);
+});
+
+test('recovery preserves medium effort when a turn fails before acceptance', async t => {
+  for (const kind of ['task', 'adversarial-review']) await t.test(kind, t => {
+    const f = fixture(t, 'turn-rpc-rejected');
+    const result = f.cli([kind, '--json', '--model', 'custom-model', '--effort', 'medium', "Don't change the request"]);
+    assert.equal(result.status, 1, result.stderr);
+    const data = parsed(result);
+    assert.equal(data.meta.resolved.effort, 'high');
+    assert.match(data.meta.error, /turn rejected before acceptance/);
+    assert.match(data.meta.recoveryCommand, /'--model' 'custom-model'/);
+    assert.match(data.meta.recoveryCommand, /'--effort' 'medium'/);
+    assert.equal(f.state().lastTurnStart, undefined);
+  });
+});
+
+test('adversarial review keeps a 1000-file untracked virtual environment prompt small', t => {
+  const f = fixture(t);
+  fs.mkdirSync(path.join(f.repo, '.venv'));
+  for (let index = 0; index < 1000; index += 1) {
+    fs.writeFileSync(path.join(f.repo, '.venv', `file-${String(index).padStart(4, '0')}.txt`), 'UNTRACKED_BODY_MARKER'.repeat(820));
+  }
+  const result = f.cli(['adversarial-review', '--effort', 'medium', '--json', 'focus']);
+  assert.equal(result.status, 0, result.stderr);
+  const prompt = f.state().lastTurnStart.prompt;
+  t.diagnostic(`Review prompt: ${Buffer.byteLength(prompt, 'utf8')} bytes for 1000 untracked files.`);
+  assert.ok(Buffer.byteLength(prompt, 'utf8') < 64 * 1024);
+  assert.match(prompt, /lightweight summary/);
+  assert.match(prompt, /\.venv\/file-0000\.txt/);
+  assert.match(prompt, /\.\.\. and 900 more/);
+  assert.doesNotMatch(prompt, /UNTRACKED_BODY_MARKER/);
+});
+
+test('task and await show concise progress and emit final output only on stdout', t => {
+  const f = fixture(t, 'with-progress');
+  const result = f.cli(['task', '--write', 'implement']);
+  assert.equal(result.status, 0, result.stderr);
+  const job = f.jobs()[0];
+  for (const output of [result, f.cli(['await', job.id])]) {
+    assert.equal(output.status, 0, output.stderr);
+    assert.equal(output.stdout, job.rendered);
+    assert.equal(output.stdout.split(job.result.rawOutput).length, 2);
+    assert.match(output.stderr, /Running command: npm test/);
+    assert.match(output.stderr, /Command completed: npm test \(exit 0\)/);
+    assert.match(output.stderr, /File changes completed: edited\.txt/);
+    assert.doesNotMatch(output.stderr, /RAW_COMMAND_OUTPUT_MARKER|RAW_PATCH_MARKER|Observed command execution|Observed file change|Assistant message|Final output|Handled the requested task/);
+  }
+  const json = f.cli(['await', job.id, '--json']);
+  assert.equal(parsed(json).rawOutput, job.result.rawOutput);
+  assert.doesNotMatch(json.stderr, /RAW_COMMAND_OUTPUT_MARKER|RAW_PATCH_MARKER|Handled the requested task/);
+  const log = fs.readFileSync(job.logFile, 'utf8');
+  assert.match(log, /Observed command execution\n\{"type":"commandExecution"/);
+  assert.match(log, /RAW_COMMAND_OUTPUT_MARKER|RAW_PATCH_MARKER/);
+  assert.match(log, /Assistant message/);
+  assert.match(log, /Final output/);
+});
+
+test('await timeout gives slash-command waiting and status hints', async t => {
+  const f = fixture(t, 'interruptible-slow-task');
+  const launch = parsed(f.cli(['task', '--background', '--json', 'inspect']));
+  await until(() => f.jobs().find(job => job.id === launch.jobId && job.turnId));
+  const result = f.cli(['await', launch.jobId, '--timeout-ms', '0']);
+  assert.equal(result.status, 124);
+  assert.ok(result.stdout.includes(`/codex:await ${launch.jobId}`));
+  assert.ok(result.stdout.includes(`/codex:status ${launch.jobId}`));
+  assert.equal(f.cli(['cancel', launch.jobId, '--json']).status, 0);
+});
+
+test('cancellation suppresses only benign rollout noise in the stored log', async t => {
+  const f = fixture(t, 'interrupt-stderr');
+  const launch = parsed(f.cli(['task', '--background', '--json', 'inspect']));
+  const job = await until(() => f.jobs().find(job => job.id === launch.jobId && job.turnId));
+  assert.equal(f.cli(['cancel', job.id, '--json']).status, 0);
+  const log = fs.readFileSync(job.logFile, 'utf8');
+  assert.doesNotMatch(log, /failed to record rollout items/);
+  assert.match(log, /unrelated cancellation diagnostic/);
+});
 
 test('root terminal errors, retryable notifications, subagent errors and transport death converge', async t => {
   for (const behavior of ['terminal-error', 'error-before-ack', 'retryable-error', 'subagent-error', 'connection-death', 'socket-close']) await t.test(behavior, t => {
@@ -209,7 +304,7 @@ test('worker death converges to failed and native review failure offers re-revie
 
 test('task argv preserves the complete literal request, including whitespace and JSON', t => {
   const f = fixture(t);
-  const request = '  Inspect {"path":"C:\\\\tmp", "flag":"--full-access", "quote":"a\\\"b"} and literal $(touch should-not-exist)\n';
+  const request = '  Don\'t reword {"path":"C:\\\\tmp", "flag":"--full-access", "quote":"a\\\"b"} and literal $(touch should-not-exist)\n';
   const result = f.cli(['task', '--json', '--', request]);
   assert.equal(result.status, 0, result.stderr);
   const prompt = f.state().lastTurnStart.prompt;
@@ -220,6 +315,12 @@ test('task argv preserves the complete literal request, including whitespace and
   assert.equal(literal.status, 0, literal.stderr);
   assert.equal(parsed(literal).sandbox, 'read-only');
   assert.ok(f.state().lastTurnStart.prompt.endsWith(flagLike));
+  const promptFile = path.join(f.repo, 'literal-prompt.txt');
+  fs.writeFileSync(promptFile, request);
+  const fromFile = f.cli(['task', '--json', '--prompt-file', promptFile]);
+  assert.equal(fromFile.status, 0, fromFile.stderr);
+  const filePrompt = f.state().lastTurnStart.prompt;
+  assert.equal(filePrompt.slice(filePrompt.indexOf('\nRequest:\n') + '\nRequest:\n'.length), request);
 });
 
 

@@ -190,7 +190,7 @@ test("collectReviewContext falls back to lightweight context for oversized singl
   assert.match(context.content, /## Changed Files/);
 });
 
-test("collectReviewContext keeps untracked file content in lightweight working tree context", () => {
+test("collectReviewContext lists untracked paths without content in lightweight working tree context", () => {
   const cwd = makeTempDir();
   initGitRepo(cwd);
   for (const name of ["a.js", "b.js"]) {
@@ -209,5 +209,47 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   assert.equal(context.fileCount, 3);
   assert.doesNotMatch(context.content, /TRACKED_MARKER_[AB]/);
   assert.match(context.content, /## Untracked Files/);
-  assert.match(context.content, /UNTRACKED_RISK_MARKER/);
+  assert.match(context.content, /new-risk\.js/);
+  assert.doesNotMatch(context.content, /UNTRACKED_RISK_MARKER/);
+});
+
+test("collectReviewContext bounds untracked content by total UTF-8 bytes in inline mode", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "tracked.txt"), "initial\n");
+  run("git", ["add", "."], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "a.txt"), "€".repeat(8192));
+  fs.writeFileSync(path.join(cwd, "b.txt"), "€".repeat(8192));
+  fs.writeFileSync(path.join(cwd, "c.txt"), "x".repeat(16 * 1024));
+  fs.writeFileSync(path.join(cwd, "d.txt"), "BUDGET_OVERFLOW_MARKER");
+
+  const context = collectReviewContext(cwd, resolveReviewTarget(cwd), { maxInlineFiles: 10 });
+
+  assert.equal(context.inputMode, "inline-diff");
+  assert.equal((context.content.match(/€/g) ?? []).length, 16384);
+  assert.match(context.content, /xxx/);
+  assert.match(context.content, /### d\.txt\n\(skipped: untracked content budget exhausted\)/);
+  assert.doesNotMatch(context.content, /BUDGET_OVERFLOW_MARKER/);
+  assert.ok(Buffer.byteLength(context.content, "utf8") < 70 * 1024);
+});
+
+test("collectReviewContext bounds status and path listings even when inline mode is forced", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "tracked.txt"), "initial\n");
+  run("git", ["add", "."], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  for (let index = 0; index < 150; index += 1) {
+    fs.writeFileSync(path.join(cwd, `file-${String(index).padStart(3, "0")}.txt`), "small content\n");
+  }
+
+  for (const includeDiff of [false, true]) {
+    const context = collectReviewContext(cwd, resolveReviewTarget(cwd), { includeDiff });
+    assert.equal(context.fileCount, 150);
+    assert.match(context.content, /file-000\.txt/);
+    assert.doesNotMatch(context.content, /file-100\.txt/);
+    assert.equal((context.content.match(/\.\.\. and 50 more/g) ?? []).length, includeDiff ? 2 : 3);
+    assert.ok(Buffer.byteLength(context.content, "utf8") < 16 * 1024);
+  }
 });

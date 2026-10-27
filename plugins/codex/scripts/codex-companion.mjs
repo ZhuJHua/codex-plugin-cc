@@ -706,7 +706,10 @@ async function observeJob(cwd, id, options = {}) {
             pendingLog += decoder.write(chunk.subarray(0, bytes));
             const lines = pendingLog.split("\n");
             pendingLog = lines.pop();
-            for (const line of lines) if (!/^\[[^\]]+\] \[diagnostic\]/.test(line)) process.stderr.write(`${line}\n`);
+            for (const line of lines) {
+              const progress = line.match(/^(\[[^\]]+\]) \[progress\] (.*)$/);
+              if (progress) process.stderr.write(`${progress[1]} ${progress[2]}\n`);
+            }
             offset += bytes;
           }
         } finally { fs.closeSync(fd); }
@@ -720,7 +723,7 @@ async function observeJob(cwd, id, options = {}) {
     if (payload.codex) payload.codex = { ...payload.codex, status: 1 };
   }
   if (timedOut) payload.waitTimedOut = true;
-  outputCommandResult(payload, timedOut ? `Job ${id} is still ${job.status}. Resume waiting with await ${id}.\n` : ["failed", "cancelled"].includes(job.status) ? renderStoredJobResult(job, job) : job.rendered || `${job.errorMessage ?? "No final output recorded."}\n`, options.json);
+  outputCommandResult(payload, timedOut ? `Job ${id} is still ${job.status}. Resume waiting with /codex:await ${id} or check /codex:status ${id}.\n` : ["failed", "cancelled"].includes(job.status) ? renderStoredJobResult(job, job) : job.rendered || `${job.errorMessage ?? "No final output recorded."}\n`, options.json);
   if (job.status === "failed" || job.status === "cancelled") process.stderr.write(`${job.errorMessage ?? job.status}\n`);
   process.exitCode = timedOut ? 124 : job.status === "completed" ? 0 : 1;
 }

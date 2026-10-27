@@ -5,6 +5,9 @@ import { isProbablyText } from "./fs.mjs";
 import { formatCommandFailure, runCommand, runCommandChecked } from "./process.mjs";
 
 const MAX_UNTRACKED_BYTES = 24 * 1024;
+const MAX_INLINE_UNTRACKED_BYTES = 64 * 1024;
+const MAX_LISTED_PATHS = 100;
+const MAX_LISTING_BYTES = 32 * 1024;
 const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
 const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
 
@@ -194,7 +197,23 @@ function formatSection(title, body) {
   return [`## ${title}`, "", body.trim() ? body.trim() : "(none)", ""].join("\n");
 }
 
-function formatUntrackedFile(cwd, relativePath) {
+function boundedListing(lines, format = line => line) {
+  const listed = [];
+  let bytes = 0;
+  for (const line of lines.slice(0, MAX_LISTED_PATHS)) {
+    const size = Buffer.byteLength(line, "utf8") + 1;
+    if (bytes + size > MAX_LISTING_BYTES) break;
+    listed.push(format(line));
+    bytes += size;
+  }
+  if (listed.length < lines.length) listed.push(`... and ${lines.length - listed.length} more`);
+  return listed.join("\n");
+}
+
+function formatUntrackedFile(cwd, relativePath, budget) {
+  if (budget.remaining <= 0) {
+    return `### ${relativePath}\n(skipped: untracked content budget exhausted)`;
+  }
   const absolutePath = path.join(cwd, relativePath);
   let stat;
   try {
@@ -208,6 +227,9 @@ function formatUntrackedFile(cwd, relativePath) {
   if (stat.size > MAX_UNTRACKED_BYTES) {
     return `### ${relativePath}\n(skipped: ${stat.size} bytes exceeds ${MAX_UNTRACKED_BYTES} byte limit)`;
   }
+  if (stat.size > budget.remaining) {
+    return `### ${relativePath}\n(skipped: untracked content budget exhausted)`;
+  }
 
   let buffer;
   try {
@@ -218,20 +240,25 @@ function formatUntrackedFile(cwd, relativePath) {
   if (!isProbablyText(buffer)) {
     return `### ${relativePath}\n(skipped: binary file)`;
   }
+  if (buffer.length > budget.remaining) {
+    return `### ${relativePath}\n(skipped: untracked content budget exhausted)`;
+  }
+  budget.remaining -= buffer.length;
 
   return [`### ${relativePath}`, "```", buffer.toString("utf8").trimEnd(), "```"].join("\n");
 }
 
 function collectWorkingTreeContext(cwd, state, options = {}) {
   const includeDiff = options.includeDiff !== false;
-  const status = gitChecked(cwd, ["status", "--short", "--untracked-files=all"]).stdout.trim();
+  const status = boundedListing(gitChecked(cwd, ["status", "--short", "--untracked-files=normal"]).stdout.trim().split("\n").filter(Boolean));
   const changedFiles = listUniqueFiles(state.staged, state.unstaged, state.untracked);
 
   let parts;
   if (includeDiff) {
     const stagedDiff = gitChecked(cwd, ["diff", "--cached", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
     const unstagedDiff = gitChecked(cwd, ["diff", "--binary", "--no-ext-diff", "--submodule=diff"]).stdout;
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+    const budget = { remaining: MAX_INLINE_UNTRACKED_BYTES };
+    const untrackedBody = boundedListing(state.untracked, file => formatUntrackedFile(cwd, file, budget));
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff", stagedDiff),
@@ -241,12 +268,12 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
   } else {
     const stagedStat = gitChecked(cwd, ["diff", "--shortstat", "--cached"]).stdout.trim();
     const unstagedStat = gitChecked(cwd, ["diff", "--shortstat"]).stdout.trim();
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+    const untrackedBody = boundedListing(state.untracked);
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff Stat", stagedStat),
       formatSection("Unstaged Diff Stat", unstagedStat),
-      formatSection("Changed Files", changedFiles.join("\n")),
+      formatSection("Changed Files", boundedListing(changedFiles)),
       formatSection("Untracked Files", untrackedBody)
     ];
   }

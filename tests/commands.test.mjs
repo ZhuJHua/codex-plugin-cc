@@ -65,6 +65,18 @@ test("rescue preloads existing version-neutral skills with valid local reference
   assert.equal(fs.existsSync(path.join(PLUGIN_ROOT, "skills", "gpt-5-4-prompting")), false);
 });
 
+test("forwarding instructions require literal task text and verbatim output", () => {
+  for (const file of ["agents/codex-rescue.md", "skills/codex-cli-runtime/SKILL.md"]) {
+    const source = read(file);
+    assert.match(source, /Pass task text verbatim/);
+    assert.match(source, /never reword it/);
+    assert.match(source, /Prefer a prompt file or literal argv/);
+    assert.match(source, /[Rr]eturn companion stdout verbatim/);
+    assert.match(source, /Either omit stderr progress lines or copy them verbatim; never summarise or annotate them/);
+    assert.match(source, /Copy actionable failure stderr verbatim/);
+  }
+});
+
 test("plugin exposes task recovery through the await command", () => {
   assert.deepEqual(fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort(), [
     "adversarial-review.md", "await.md", "cancel.md", "rescue.md", "result.md",

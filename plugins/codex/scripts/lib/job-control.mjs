@@ -53,7 +53,7 @@ function getJobTypeLabel(job) {
 }
 
 function stripLogPrefix(line) {
-  return line.replace(/^\[[^\]]+\]\s*/, "").trim();
+  return line.replace(/^\[[^\]]+\]\s*/, "").replace(/^\[progress\]\s*/, "").trim();
 }
 
 function isProgressBlockTitle(line) {

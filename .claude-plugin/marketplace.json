@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Codex delegation and review for Claude Code, maintained by ZhuJHua from the OpenAI plugin.",
-    "version": "1.1.1"
+    "version": "1.1.2"
   },
   "plugins": [
     {
       "name": "codex",
       "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "author": {
         "name": "ZhuJHua"
       },

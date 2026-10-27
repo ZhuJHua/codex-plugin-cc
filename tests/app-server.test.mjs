@@ -12,6 +12,32 @@ function fixture(behavior) {
   return { cwd, env: buildEnv(bin) };
 }
 
+test('rollout thread-not-found diagnostics are suppressed only after initiated shutdown', async () => {
+  const noise = '\u001b[31m2026-10-27T00:00:00Z ERROR codex_core::session: failed to record rollout items: thread thr_1 not found\u001b[0m';
+  const client = new CodexAppServerClient('unused');
+  client.handleStderrLine(noise);
+  assert.match(client.stderr, /thread thr_1 not found/);
+  client.stderr = '';
+  client.sendMessage = message => client.handleLine(JSON.stringify({ id: message.id, result: {} }));
+  await client.request('turn/interrupt', { threadId: 'thr_1', turnId: 'turn_1' });
+  client.handleStderrLine(noise);
+  client.handleStderrLine('ERROR codex_core::session: failed to record rollout items: disk full');
+  client.handleStderrLine('ERROR other_module: thread thr_1 not found');
+  assert.doesNotMatch(client.stderr, /rollout items: thread thr_1 not found/);
+  assert.match(client.stderr, /disk full/);
+  assert.match(client.stderr, /other_module/);
+
+  const controller = new AbortController();
+  const cancelled = new CodexAppServerClient('unused', { signal: controller.signal });
+  controller.abort();
+  cancelled.handleStderrLine(noise);
+  assert.equal(cancelled.stderr, '');
+  const closed = new CodexAppServerClient('unused');
+  await closed.close();
+  closed.handleStderrLine(noise);
+  assert.equal(closed.stderr, '');
+});
+
 test('default clients own separate process groups and closing one preserves the other', async t => {
   const f = fixture();
   let firstProcess, secondProcess;

@@ -18,8 +18,8 @@ export function recoveryCommand(job) {
     if (request.base) args.push("--base", request.base);
     if (request.scope) args.push("--scope", request.scope);
   }
-  const model = job.resolved?.model ?? request.model;
-  const effort = job.resolved?.effort ?? request.effort;
+  const model = request.model ?? request.requestedModel ?? job.requested?.model ?? job.resolved?.model;
+  const effort = request.effort ?? request.requestedEffort ?? job.requested?.effort ?? job.resolved?.effort;
   if (model) args.push("--model", model);
   if (effort && command !== "review") args.push("--effort", effort);
   if (!review) args.push("--", "Continue after inspecting existing changes and partial results.");

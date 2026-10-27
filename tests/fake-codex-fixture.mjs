@@ -321,7 +321,7 @@ rl.on("line", (line) => {
         saveState(state);
         if (BEHAVIOR === "catalog-paged" && !message.params.cursor) {
           send({ id: message.id, result: { data: [{ id: "other-model", model: "other-model", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "ultra" }] }], nextCursor: "second-page" } });
-        } else send({ id: message.id, result: { data: [{ id: "known-model", model: "known-model", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "high" }] }], nextCursor: null } });
+        } else send({ id: message.id, result: { data: [{ id: "known-model", model: "known-model", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "medium" }, { reasoningEffort: "high" }] }], nextCursor: null } });
         break;
       }
 
@@ -338,7 +338,7 @@ rl.on("line", (line) => {
         liveThreadIds.add(thread.id);
         state.lastThreadStart = message.params;
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: thread.sandbox, reasoningEffort: BEHAVIOR === "capacity-rpc-once" ? "medium" : null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: thread.sandbox, reasoningEffort: BEHAVIOR === "turn-rpc-rejected" ? "high" : BEHAVIOR === "capacity-rpc-once" ? "medium" : null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -485,6 +485,7 @@ rl.on("line", (line) => {
 
 	      case "turn/start": {
 	        const thread = ensureThread(state, message.params.threadId);
+        if (BEHAVIOR === "turn-rpc-rejected") throw new Error("turn rejected before acceptance");
         if (BEHAVIOR === "sandbox-policy-rejected" && message.params.sandboxPolicy?.type === "dangerFullAccess") {
           throw new Error("dangerFullAccess is not allowed by managed policy");
         }
@@ -649,6 +650,18 @@ rl.on("line", (line) => {
         }
 
         const items = [
+          ...(BEHAVIOR === "with-progress"
+            ? [
+                {
+                  started: { type: "commandExecution", id: "command_" + turnId, command: "npm test", status: "inProgress" },
+                  completed: { type: "commandExecution", id: "command_" + turnId, command: "npm test", status: "completed", exitCode: 0, aggregatedOutput: "RAW_COMMAND_OUTPUT_MARKER" }
+                },
+                {
+                  started: { type: "fileChange", id: "change_" + turnId, status: "inProgress", changes: [{ path: "edited.txt", kind: { type: "update" }, diff: "RAW_PATCH_MARKER" }] },
+                  completed: { type: "fileChange", id: "change_" + turnId, status: "completed", changes: [{ path: "edited.txt", kind: { type: "update" }, diff: "RAW_PATCH_MARKER" }] }
+                }
+              ]
+            : []),
           ...(BEHAVIOR === "with-reasoning"
             ? [
                 {
@@ -666,7 +679,7 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (BEHAVIOR === "interruptible-slow-task" || BEHAVIOR === "interrupt-stderr") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
@@ -690,6 +703,10 @@ rl.on("line", (line) => {
 	      }
 
 	      case "turn/interrupt": {
+        if (BEHAVIOR === "interrupt-stderr") {
+          process.stderr.write("ERROR codex_core::session: failed to record rollout items: thread " + message.params.threadId + " not found\\n");
+          process.stderr.write("ERROR codex_core::session: unrelated cancellation diagnostic\\n");
+        }
 	        state.lastInterrupt = {
 	          threadId: message.params.threadId,
 	          turnId: message.params.turnId
