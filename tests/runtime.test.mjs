@@ -1,20 +1,53 @@
+import "./environment.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { processIdentity } from "../plugins/codex/scripts/lib/process-identity.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
+
+function runAsync(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", chunk => { stdout += chunk; });
+    child.stderr.on("data", chunk => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", status => resolve({ status, stdout, stderr }));
+    child.stdin.end(options.input ?? "");
+  });
+}
+
+function writeIndexedArtifacts(workspace) {
+  const stateDir = resolveStateDir(workspace);
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  for (const job of state.jobs) {
+    const file = path.join(stateDir, "jobs", `${job.id}.json`);
+    const artifact = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+    fs.writeFileSync(file, JSON.stringify({ ...job, ...artifact, workspaceRoot: workspace }));
+  }
+}
+
+function assertDelegatedRequest(prompt, request) {
+  const marker = "\nRequest:\n";
+  const offset = prompt.indexOf(marker);
+  assert.ok(offset > 0, "fresh task should carry the delegation contract");
+  assert.equal(prompt.slice(offset + marker.length), request);
+}
 
 async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -356,7 +389,7 @@ test("review accepts the quoted raw argument style for built-in base-branch revi
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
 
-  const result = run("node", [SCRIPT, "review", "--base main"], {
+  const result = run("node", [SCRIPT, "review", "--raw-args", "--base main"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -611,7 +644,7 @@ test("task --resume-last does not resume a task from another Claude session", ()
 
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.threadId, "thr_1");
-  assert.equal(fakeState.lastTurnStart.prompt, "initial task");
+  assertDelegatedRequest(fakeState.lastTurnStart.prompt, "initial task");
 });
 
 test("task --resume-last ignores running tasks from other Claude sessions", () => {
@@ -635,6 +668,7 @@ test("task --resume-last ignores running tasks from other Claude sessions", () =
           {
             id: "task-other-running",
             status: "running",
+            pid: process.pid,
             title: "Codex Task",
             jobClass: "task",
             sessionId: "sess-other",
@@ -716,6 +750,188 @@ test("write task output focuses on the Codex result without generic follow-up hi
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+test("task --full-access enables unrestricted execution and records its sandbox", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--full-access", "--json", "run the Flutter tests"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.sandbox, "danger-full-access");
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadStart.sandbox, "danger-full-access");
+  assert.equal(fakeState.lastThreadStart.approvalPolicy, "never");
+  assert.deepEqual(fakeState.lastTurnStart.sandboxPolicy, { type: "dangerFullAccess" });
+  assert.equal(fakeState.lastTurnStart.approvalPolicy, "never");
+  assertDelegatedRequest(fakeState.lastTurnStart.prompt, "run the Flutter tests");
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(status.status, 0, status.stderr);
+  const job = JSON.parse(status.stdout).latestFinished;
+  assert.equal(job.sandbox, "danger-full-access");
+  assert.equal(job.write, true);
+  assert.match(fs.readFileSync(job.logFile, "utf8"), /requested sandbox: danger-full-access/);
+});
+
+test("task preserves existing sandbox defaults without explicit full access", () => {
+  for (const [flags, expectedMode, expectedType] of [
+    [[], "read-only", "readOnly"],
+    [["--write"], "workspace-write", "workspaceWrite"],
+    [["--full-access=false"], "read-only", "readOnly"],
+    [["--write", "--full-access=false"], "workspace-write", "workspaceWrite"]
+  ]) {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+    initGitRepo(repo);
+    const result = run("node", [SCRIPT, "task", ...flags, "diagnose tests"], { cwd: repo, env: buildEnv(binDir) });
+    assert.equal(result.status, 0, result.stderr);
+    const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+    assert.equal(state.lastThreadStart.sandbox, expectedMode);
+    assert.equal(state.lastTurnStart.effectiveSandbox.type, expectedType);
+    assert.equal(state.lastTurnStart.sandboxPolicy, null);
+  }
+});
+
+test("task treats full-access mentions after task text or -- as prompt text", () => {
+  for (const args of [
+    ["explain how --full-access works"],
+    ["explain", "--full-access", "works"],
+    ["--", "--full-access is a flag to document"]
+  ]) {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+    initGitRepo(repo);
+    const result = run("node", [SCRIPT, "task", ...args], { cwd: repo, env: buildEnv(binDir) });
+    assert.equal(result.status, 0, result.stderr);
+    const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+    assert.equal(state.lastThreadStart.sandbox, "read-only");
+    assert.equal(state.lastTurnStart.sandboxPolicy, null);
+    assertDelegatedRequest(state.lastTurnStart.prompt, args.filter((arg) => arg !== "--").join(" "));
+  }
+});
+
+test("task parses an explicit full-access flag in quoted raw arguments", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const result = run("node", [SCRIPT, "task", "--raw-args", '--full-access=true -- "run all tests"'], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(state.lastTurnStart.effectiveSandbox.type, "dangerFullAccess");
+  assertDelegatedRequest(state.lastTurnStart.prompt, '"run all tests"');
+});
+
+test("task rejects malformed full-access booleans before starting Codex", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  for (const flag of ["--full-access=", "--full-access=yes", "--full-access=false=true", "--full-access=true=false"]) {
+    const result = run("node", [SCRIPT, "task", flag, "run tests"], { cwd: repo, env: buildEnv(binDir) });
+    assert.notEqual(result.status, 0, flag);
+    assert.match(result.stderr, /Invalid value for --full-access/);
+  }
+  assert.equal(fs.existsSync(path.join(binDir, "fake-codex-state.json")), false);
+});
+
+test("task --resume --full-access overrides the policy of an already live thread", () => {
+  for (const initialFlags of [[], ["--write"]]) {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    const statePath = path.join(binDir, "fake-codex-state.json");
+    installFakeCodex(binDir, "live-resume-sandbox");
+    initGitRepo(repo);
+    const env = buildEnv(binDir);
+    const firstRun = run("node", [SCRIPT, "task", ...initialFlags, "investigate"], { cwd: repo, env });
+    assert.equal(firstRun.status, 0, firstRun.stderr);
+    const initialState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+
+    for (const resumeFlag of ["--resume", "--resume-last"]) {
+      const resumed = run("node", [SCRIPT, "task", resumeFlag, "--full-access", "apply the fix"], { cwd: repo, env });
+      assert.equal(resumed.status, 0, resumed.stderr);
+      const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+      assert.equal(state.lastThreadResume.threadId, initialState.lastTurnStart.threadId);
+      assert.equal(state.lastThreadResume.sandbox, "danger-full-access");
+      assert.equal(state.lastTurnStart.threadId, initialState.lastTurnStart.threadId);
+      assert.deepEqual(state.lastTurnStart.effectiveSandbox, { type: "dangerFullAccess" });
+      assert.deepEqual(state.lastTurnStart.sandboxPolicy, { type: "dangerFullAccess" });
+      assert.equal(state.lastTurnStart.prompt, "apply the fix");
+      assert.equal(state.threads.length, 1);
+      if (resumeFlag === "--resume") {
+        assert.notEqual(state.lastThreadResumeSandbox.type, "dangerFullAccess");
+      }
+    }
+  }
+});
+
+test("task refuses inherited full access on a live resume without the flag", () => {
+  for (const flags of [[], ["--write"]]) {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    const statePath = path.join(binDir, "fake-codex-state.json");
+    installFakeCodex(binDir, "live-resume-sandbox");
+    initGitRepo(repo);
+    const env = buildEnv(binDir);
+    const firstRun = run("node", [SCRIPT, "task", "--full-access", "initial task"], { cwd: repo, env });
+    assert.equal(firstRun.status, 0, firstRun.stderr);
+    const initialState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    const resumed = run("node", [SCRIPT, "task", "--resume", ...flags, "follow up"], { cwd: repo, env });
+    assert.notEqual(resumed.status, 0, resumed.stdout);
+    assert.match(resumed.stderr, /resumed thread reports sandbox dangerFullAccess/);
+    assert.match(resumed.stderr, /--fresh/);
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.deepEqual(state.lastTurnStart, initialState.lastTurnStart);
+
+    const fresh = run("node", [SCRIPT, "task", "--fresh", ...flags, "follow up"], { cwd: repo, env });
+    assert.equal(fresh.status, 0, fresh.stderr);
+    const freshState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    assert.notEqual(freshState.lastTurnStart.threadId, initialState.lastTurnStart.threadId);
+    assert.equal(freshState.lastTurnStart.effectiveSandbox.type, flags.length ? "workspaceWrite" : "readOnly");
+  }
+});
+
+test("task refuses a resumed sandbox it cannot verify without full access", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "resume-external-sandbox");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const initial = run("node", [SCRIPT, "task", "investigate"], { cwd: repo, env });
+  assert.equal(initial.status, 0, initial.stderr);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const resumed = run("node", [SCRIPT, "task", "--resume", "follow up"], { cwd: repo, env });
+  assert.notEqual(resumed.status, 0);
+  assert.match(resumed.stderr, /resumed thread reports sandbox externalSandbox/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(statePath, "utf8")).lastTurnStart, state.lastTurnStart);
+});
+
+test("task surfaces a rejected full-access policy without falling back", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "sandbox-policy-rejected");
+  initGitRepo(repo);
+  const result = run("node", [SCRIPT, "task", "--full-access", "run tests"], { cwd: repo, env: buildEnv(binDir) });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /dangerFullAccess is not allowed by managed policy/);
+  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(state.threads.length, 1);
+  assert.equal(state.lastThreadStart.sandbox, "danger-full-access");
+  assert.equal(state.lastTurnStart, undefined);
+});
+
 test("task --resume acts like --resume-last without leaking the flag into the prompt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -760,7 +976,32 @@ test("task --fresh is treated as routing control and does not leak into the prom
 
   assert.equal(result.status, 0, result.stderr);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(fakeState.lastTurnStart.prompt, "diagnose the flaky test");
+  assertDelegatedRequest(fakeState.lastTurnStart.prompt, "diagnose the flaky test");
+});
+
+test("fresh tasks preserve a supplied request file and resumed tasks send only the delta", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  const promptFile = path.join(repo, "request.txt");
+  const request = 'Implement the agreed plan.\nReturn JSON with "path": "C:\\repo\\file" and literal {{TASK_REQUEST}}.\nDocument the marker: Run a stop-gate review of the previous Claude turn.';
+  fs.writeFileSync(promptFile, request);
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const initial = run("node", [SCRIPT, "task", "--prompt-file", promptFile], { cwd: repo, env });
+  assert.equal(initial.status, 0, initial.stderr);
+  const initialState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assertDelegatedRequest(initialState.lastTurnStart.prompt, request);
+  assert.equal(initialState.threads.length, 1);
+
+  const delta = "Apply the agreed fix; the new requirement is to preserve retries.";
+  fs.writeFileSync(promptFile, delta);
+  const resumed = run("node", [SCRIPT, "task", "--resume", "--prompt-file", promptFile], { cwd: repo, env });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const resumedState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(resumedState.lastTurnStart.threadId, initialState.lastTurnStart.threadId);
+  assert.equal(resumedState.lastTurnStart.prompt, delta);
 });
 
 test("task forwards model selection and reasoning effort to app-server turn/start", () => {
@@ -872,7 +1113,7 @@ test("task ignores later subagent messages when choosing the final returned outp
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
-test("task can finish after subagent work even if the parent turn/completed event is missing", () => {
+test("task fails at its deadline when subagent work finishes without the parent turn/completed event", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "with-subagent-no-main-turn-completed");
@@ -881,16 +1122,17 @@ test("task can finish after subagent work even if the parent turn/completed even
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "challenge the current design"], {
+  const result = run("node", [SCRIPT, "task", "--job-timeout-ms", "1500", "challenge the current design"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
 
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Subagent \S+ completed/);
+  assert.match(result.stderr, /Job exceeded --job-timeout-ms/);
 });
 
-test("task using the shared broker still completes when Codex spawns subagents", () => {
+test("task uses a private runtime and completes when Codex spawns subagents", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir, "with-subagent");
@@ -907,9 +1149,7 @@ test("task using the shared broker still completes when Codex spawns subagents",
   });
   assert.equal(review.status, 0, review.stderr);
 
-  if (!loadBrokerSession(repo)) {
-    return;
-  }
+  assert.equal(loadBrokerSession(repo), null);
 
   const result = run("node", [SCRIPT, "task", "challenge the current design"], {
     cwd: repo,
@@ -918,6 +1158,8 @@ test("task using the shared broker still completes when Codex spawns subagents",
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.appServerStarts, 2);
 });
 
 test("task --background enqueues a detached worker and exposes per-job status", async () => {
@@ -969,6 +1211,69 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
+test("task --background persists full access through a resumed detached worker", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "live-resume-sandbox");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const initial = run("node", [SCRIPT, "task", "investigate"], { cwd: repo, env });
+  assert.equal(initial.status, 0, initial.stderr);
+  const launched = run("node", [SCRIPT, "task", "--background", "--resume", "--full-access", "--json", "run integration tests"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const launch = JSON.parse(launched.stdout);
+  assert.equal(launch.sandbox, "danger-full-access");
+  const waited = run("node", [SCRIPT, "status", launch.jobId, "--wait", "--timeout-ms", "15000", "--json"], { cwd: repo, env });
+  assert.equal(waited.status, 0, waited.stderr);
+  const job = JSON.parse(waited.stdout).job;
+  assert.equal(job.status, "completed");
+  assert.equal(job.write, true);
+  assert.equal(job.sandbox, "danger-full-access");
+  const stored = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${job.id}.json`), "utf8"));
+  assert.equal(stored.request.fullAccess, true);
+  assert.equal(stored.result.sandbox, "danger-full-access");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.lastThreadResumeSandbox.type, "readOnly");
+  assert.equal(state.lastTurnStart.effectiveSandbox.type, "dangerFullAccess");
+  assert.equal(state.lastTurnStart.prompt, "run integration tests");
+
+  const textStatus = run("node", [SCRIPT, "status", job.id], { cwd: repo, env });
+  assert.equal(textStatus.status, 0, textStatus.stderr);
+  assert.match(textStatus.stdout, /Sandbox: danger-full-access/);
+});
+
+test("task-worker preserves sandbox selection for jobs saved before full-access support", () => {
+  for (const write of [false, true]) {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+    initGitRepo(repo);
+    const jobId = "task-legacy";
+    const jobsDir = path.join(resolveStateDir(repo), "jobs");
+    fs.mkdirSync(jobsDir, { recursive: true });
+    fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), JSON.stringify({
+      id: jobId,
+      title: "Codex Task",
+      jobClass: "task",
+      workspaceRoot: repo,
+      write,
+      status: "queued",
+      claimToken: `legacy-${write}`,
+      logFile: path.join(jobsDir, `${jobId}.log`),
+      request: { kind: "task", cwd: repo, write, prompt: "run the old job", jobId }
+    }));
+    const result = run("node", [SCRIPT, "task-worker", "--job-id", jobId], { cwd: repo, env: buildEnv(binDir) });
+    assert.equal(result.status, 0, result.stderr);
+    const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+    assert.equal(state.lastThreadStart.sandbox, write ? "workspace-write" : "read-only");
+    assert.equal(state.lastTurnStart.sandboxPolicy, null);
+  }
+});
+
 test("review rejects focus text because it is native-review only", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
@@ -979,7 +1284,7 @@ test("review rejects focus text because it is native-review only", () => {
   run("git", ["commit", "-m", "init"], { cwd: repo });
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
-  const result = run("node", [SCRIPT, "review", "--scope working-tree focus on auth"], {
+  const result = run("node", [SCRIPT, "review", "--raw-args", "--scope working-tree focus on auth"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
@@ -1048,8 +1353,11 @@ test("review accepts --background while still running as a tracked review job", 
 
   assert.equal(launched.status, 0, launched.stderr);
   const launchPayload = JSON.parse(launched.stdout);
-  assert.equal(launchPayload.review, "Review");
-  assert.match(launchPayload.codex.stdout, /No material issues found/);
+  assert.ok(launchPayload.jobId);
+  assert.ok(["queued", "running"].includes(launchPayload.status));
+  const waited = run("node", [SCRIPT, "await", launchPayload.jobId, "--timeout-ms", "15000", "--json"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).meta.jobStatus, "completed");
 
   const status = run("node", [SCRIPT, "status"], {
     cwd: repo,
@@ -1108,6 +1416,7 @@ test("status shows phases, hints, and the latest finished job", () => {
             kind: "review",
             kindLabel: "review",
             status: "running",
+            pid: process.pid,
             title: "Codex Review",
             jobClass: "review",
             phase: "reviewing",
@@ -1137,6 +1446,7 @@ test("status shows phases, hints, and the latest finished job", () => {
     "utf8"
   );
 
+  writeIndexedArtifacts(workspace);
   const result = run("node", [SCRIPT, "status"], {
     cwd: workspace
   });
@@ -1183,6 +1493,7 @@ test("status without a job id only shows jobs from the current Claude session", 
             kind: "review",
             kindLabel: "review",
             status: "running",
+            pid: process.pid,
             title: "Codex Review",
             jobClass: "review",
             phase: "reviewing",
@@ -1251,6 +1562,7 @@ test("status preserves adversarial review kind labels", () => {
             id: "review-adv-live",
             kind: "adversarial-review",
             status: "running",
+            pid: process.pid,
             title: "Codex Adversarial Review",
             jobClass: "review",
             phase: "reviewing",
@@ -1306,6 +1618,7 @@ test("status --wait times out cleanly when a job is still active", () => {
       {
         id: "task-live",
         status: "running",
+            pid: process.pid,
         title: "Codex Task",
         logFile
       },
@@ -1325,6 +1638,7 @@ test("status --wait times out cleanly when a job is still active", () => {
           {
             id: "task-live",
             status: "running",
+            pid: process.pid,
             title: "Codex Task",
             jobClass: "task",
             summary: "Investigate flaky test",
@@ -1345,7 +1659,7 @@ test("status --wait times out cleanly when a job is still active", () => {
     cwd: workspace
   });
 
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status, 124, result.stderr);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.job.id, "task-live");
   assert.equal(payload.job.status, "running");
@@ -1498,6 +1812,7 @@ test("result without a job id prefers the latest finished job from the current C
     "utf8"
   );
 
+  writeIndexedArtifacts(workspace);
   const result = run("node", [SCRIPT, "result"], {
     cwd: workspace,
     env: {
@@ -1550,6 +1865,9 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
     detached: true,
     stdio: "ignore"
   });
+  await once(sleeper, "spawn");
+  const workerIdentity = processIdentity(sleeper.pid);
+  assert.ok(workerIdentity, "spawned test worker must have an inspectable process identity");
   sleeper.unref();
 
   t.after(() => {
@@ -1573,6 +1891,9 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
       {
         id: "task-live",
         status: "running",
+        pid: sleeper.pid,
+        workerIdentity,
+        workerPgid: process.platform === "win32" ? null : sleeper.pid,
         title: "Codex Task",
         logFile
       },
@@ -1595,6 +1916,7 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
             jobClass: "task",
             summary: "Investigate flaky test",
             pid: sleeper.pid,
+            workerIdentity,
             logFile,
             createdAt: "2026-03-18T15:30:00.000Z",
             startedAt: "2026-03-18T15:30:01.000Z",
@@ -1608,7 +1930,8 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
     "utf8"
   );
 
-  const cancelResult = run("node", [SCRIPT, "cancel", "task-live", "--json"], {
+  writeIndexedArtifacts(workspace);
+  const cancelResult = await runAsync("node", [SCRIPT, "cancel", "task-live", "--json"], {
     cwd: workspace
   });
 
@@ -1631,7 +1954,8 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
 
   const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
   assert.equal(stored.status, "cancelled");
-  assert.match(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
+  assert.equal(stored.errorMessage, "Cancelled by user.");
+  assert.match(fs.readFileSync(logFile, "utf8"), /Starting Codex Task/);
 });
 
 test("cancel without a job id ignores active jobs from other Claude sessions", () => {
@@ -1652,6 +1976,7 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
           {
             id: "task-other",
             status: "running",
+            pid: process.pid,
             title: "Codex Task",
             jobClass: "task",
             sessionId: "sess-other",
@@ -1689,8 +2014,13 @@ test("cancel without a job id ignores active jobs from other Claude sessions", (
   assert.equal(state.jobs[0].status, "running");
 });
 
-test("cancel with a job id can still target an active job from another Claude session", () => {
+test("cancel with a job id can still target an active job from another Claude session", async (t) => {
   const workspace = makeTempDir();
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { cwd: workspace, detached: true, stdio: "ignore" });
+  t.after(() => { try { sleeper.kill("SIGKILL"); } catch {} });
+  await once(sleeper, "spawn");
+  const workerIdentity = processIdentity(sleeper.pid);
+  assert.ok(workerIdentity, "spawned test worker must have an inspectable process identity");
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
@@ -1707,6 +2037,9 @@ test("cancel with a job id can still target an active job from another Claude se
           {
             id: "task-other",
             status: "running",
+            pid: sleeper.pid,
+            workerIdentity,
+            workerPgid: process.platform === "win32" ? null : sleeper.pid,
             title: "Codex Task",
             jobClass: "task",
             sessionId: "sess-other",
@@ -1726,7 +2059,8 @@ test("cancel with a job id can still target an active job from another Claude se
     ...process.env,
     CODEX_COMPANION_SESSION_ID: "sess-current"
   };
-  const cancel = run("node", [SCRIPT, "cancel", "task-other", "--json"], {
+  writeIndexedArtifacts(workspace);
+  const cancel = await runAsync("node", [SCRIPT, "cancel", "task-other", "--json"], {
     cwd: workspace,
     env
   });
@@ -1737,7 +2071,7 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(state.jobs[0].status, "cancelled");
 });
 
-test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
+test("cancel sends turn interrupt to the private app-server before stopping its worker", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
@@ -1776,8 +2110,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cancelResult.status, 0, cancelResult.stderr);
   const cancelPayload = JSON.parse(cancelResult.stdout);
   assert.equal(cancelPayload.status, "cancelled");
-  assert.equal(cancelPayload.turnInterruptAttempted, true);
-  assert.equal(cancelPayload.turnInterrupted, true);
+  assert.equal(cancelPayload.meta.jobStatus, "cancelled");
 
   await waitFor(() => {
     const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
@@ -1801,7 +2134,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("session end fully cleans up jobs for the ending session", async (t) => {
+test("session end cancels owner work and preserves records and logs", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -1829,6 +2162,9 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     detached: true,
     stdio: "ignore"
   });
+  await once(sleeper, "spawn");
+  const workerIdentity = processIdentity(sleeper.pid);
+  assert.ok(workerIdentity, "spawned test worker must have an inspectable process identity");
   sleeper.unref();
   fs.writeFileSync(runningJobFile, JSON.stringify({ id: "review-running" }, null, 2), "utf8");
 
@@ -1866,6 +2202,8 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
             title: "Codex Review",
             sessionId: "sess-current",
             pid: sleeper.pid,
+            workerIdentity,
+            workerPgid: process.platform === "win32" ? null : sleeper.pid,
             logFile: runningLog,
             createdAt: "2026-03-18T15:32:00.000Z",
             updatedAt: "2026-03-18T15:33:00.000Z"
@@ -1887,7 +2225,11 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
     "utf8"
   );
 
-  const result = run("node", [SESSION_HOOK, "SessionEnd"], {
+  // Job artifacts are authoritative; keep the index and artifacts consistent.
+  const seeded = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  for (const job of seeded.jobs) fs.writeFileSync(path.join(jobsDir, `${job.id}.json`), JSON.stringify({ ...job, workspaceRoot: repo }));
+  saveBrokerSession(repo, { endpoint: "unix:/tmp/retained-legacy-session.sock" });
+  const result = await runAsync("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
     env: {
       ...process.env,
@@ -1901,11 +2243,14 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   });
 
   assert.equal(result.status, 0, result.stderr);
+  assert.equal(loadBrokerSession(repo).endpoint, "unix:/tmp/retained-legacy-session.sock");
+  assert.equal(fs.readFileSync(completedLog, "utf8"), "completed\n");
+  assert.equal(fs.readFileSync(runningLog, "utf8"), "running\n");
   assert.equal(fs.existsSync(otherSessionLog), true);
   assert.equal(fs.existsSync(otherJobFile), true);
   assert.deepEqual(
     fs.readdirSync(path.dirname(otherJobFile)).sort(),
-    [path.basename(otherJobFile), path.basename(otherSessionLog)].sort()
+    [completedJobFile, completedLog, runningJobFile, runningLog, otherJobFile, otherSessionLog].map(file => path.basename(file)).sort()
   );
 
   await waitFor(() => {
@@ -1918,8 +2263,10 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   });
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
-  const otherJob = state.jobs[0];
+  assert.equal(state.jobs.length, 3);
+  assert.equal(state.jobs.find(job => job.id === "review-running").status, "cancelled");
+  assert.equal(state.jobs.find(job => job.id === "review-completed").status, "completed");
+  const otherJob = state.jobs.find(job => job.id === "review-other");
   assert.equal(otherJob.logFile, otherSessionLog);
 });
 
@@ -1963,8 +2310,8 @@ test("stop hook runs a stop-time review task and blocks on findings when the rev
   assert.match(blockedPayload.reason, /Missing empty-state guard/i);
 
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
-  assert.match(fakeState.lastTurnStart.prompt, /<task>/i);
-  assert.match(fakeState.lastTurnStart.prompt, /<compact_output_contract>/i);
+  assert.match(fakeState.lastTurnStart.prompt, /^Run a stop-gate review of the previous Claude turn\./);
+  assert.doesNotMatch(fakeState.lastTurnStart.prompt, /You are receiving a delegated task/);
   assert.match(fakeState.lastTurnStart.prompt, /Only review the work from the previous Claude turn/i);
   assert.match(fakeState.lastTurnStart.prompt, /I completed the refactor and updated the retry logic\./);
 
@@ -2005,6 +2352,7 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
           {
             id: "task-live",
             status: "running",
+            pid: process.pid,
             title: "Codex Task",
             jobClass: "task",
             sessionId: "sess-current",
@@ -2116,7 +2464,7 @@ test("stop hook runs the actual task when auth status looks stale", () => {
   assert.match(payload.reason, /Missing empty-state guard/i);
 });
 
-test("commands lazily start and reuse one shared app-server after first use", async () => {
+test("commands start an independent app-server for each tracked job", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
@@ -2136,10 +2484,7 @@ test("commands lazily start and reuse one shared app-server after first use", as
   });
   assert.equal(review.status, 0, review.stderr);
 
-  const brokerSession = loadBrokerSession(repo);
-  if (!brokerSession) {
-    return;
-  }
+  assert.equal(loadBrokerSession(repo), null);
 
   const adversarial = run("node", [SCRIPT, "adversarial-review"], {
     cwd: repo,
@@ -2148,7 +2493,7 @@ test("commands lazily start and reuse one shared app-server after first use", as
   assert.equal(adversarial.status, 0, adversarial.stderr);
 
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
-  assert.equal(fakeState.appServerStarts, 1);
+  assert.equal(fakeState.appServerStarts, 2);
 
   const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
@@ -2161,7 +2506,7 @@ test("commands lazily start and reuse one shared app-server after first use", as
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("setup reuses an existing shared app-server without starting another one", () => {
+test("setup independently checks readiness after a private task runtime exits", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
@@ -2181,10 +2526,7 @@ test("setup reuses an existing shared app-server without starting another one", 
   });
   assert.equal(review.status, 0, review.stderr);
 
-  const brokerSession = loadBrokerSession(repo);
-  if (!brokerSession) {
-    return;
-  }
+  assert.equal(loadBrokerSession(repo), null);
 
   const setup = run("node", [SCRIPT, "setup", "--json"], {
     cwd: repo,
@@ -2193,7 +2535,7 @@ test("setup reuses an existing shared app-server without starting another one", 
   assert.equal(setup.status, 0, setup.stderr);
 
   const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
-  assert.equal(fakeState.appServerStarts, 1);
+  assert.equal(fakeState.appServerStarts, 2);
 
   const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
@@ -2206,31 +2548,10 @@ test("setup reuses an existing shared app-server without starting another one", 
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("status reports shared session runtime when a lazy broker is active", () => {
+test("status reports a legacy shared runtime when its broker record exists", () => {
   const repo = makeTempDir();
-  const binDir = makeTempDir();
-  installFakeCodex(binDir);
-  initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
-  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
-
-  const review = run("node", [SCRIPT, "review"], {
-    cwd: repo,
-    env: buildEnv(binDir)
-  });
-  assert.equal(review.status, 0, review.stderr);
-
-  if (!loadBrokerSession(repo)) {
-    return;
-  }
-
-  const result = run("node", [SCRIPT, "status"], {
-    cwd: repo,
-    env: buildEnv(binDir)
-  });
-
+  saveBrokerSession(repo, { endpoint: "unix:/tmp/legacy-runtime-test.sock" });
+  const result = run("node", [SCRIPT, "status"], { cwd: repo });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Session runtime: shared session/);
 });

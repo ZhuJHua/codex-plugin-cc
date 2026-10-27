@@ -54,6 +54,11 @@ export interface CodexAppServerClientOptions {
   brokerEndpoint?: string;
   disableBroker?: boolean;
   reuseExistingBroker?: boolean;
+  requestTimeoutMs?: number;
+  signal?: AbortSignal;
+  ownedProcessGroup?: boolean;
+  onStderr?: (stderr: string) => void;
+  onProcess?: (update: { appServerPid: number; appServerIdentity?: string | null; appServerPgid: number | null }) => void;
 }
 
 export interface AppServerMethodMap {

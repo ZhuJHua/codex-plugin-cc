@@ -1,3 +1,4 @@
+import { sanitizeStderr } from "./diagnostics.mjs";
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -128,6 +129,9 @@ function pushJobDetails(lines, job, options = {}) {
   }
   if (job.phase) {
     lines.push(`  Phase: ${job.phase}`);
+  }
+  if (job.sandbox) {
+    lines.push(`  Sandbox: ${job.sandbox}`);
   }
   if (options.showElapsed && job.elapsed) {
     lines.push(`  Elapsed: ${job.elapsed}`);
@@ -287,7 +291,7 @@ export function renderReviewResult(parsedResult, meta) {
 
 export function renderNativeReviewResult(result, meta) {
   const stdout = result.stdout.trim();
-  const stderr = result.stderr.trim();
+  const stderr = sanitizeStderr(result.stderr);
   const lines = [
     `# Codex ${meta.reviewLabel}`,
     "",
@@ -303,7 +307,7 @@ export function renderNativeReviewResult(result, meta) {
     lines.push("Codex review failed.");
   }
 
-  if (stderr) {
+  if (result.status !== 0 && stderr) {
     lines.push("", "stderr:", "", "```text", stderr, "```");
   }
 
@@ -318,7 +322,7 @@ export function renderTaskResult(parsedResult, meta) {
     return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
   }
 
-  const message = String(parsedResult?.failureMessage ?? "").trim() || "Codex did not return a final message.";
+  const message = sanitizeStderr(parsedResult?.failureMessage) || "Codex did not return a final message.";
   return `${message}\n`;
 }
 
@@ -388,6 +392,14 @@ export function renderJobStatusReport(job) {
 }
 
 export function renderStoredJobResult(job, storedJob) {
+  if (["failed", "cancelled"].includes(job.status)) {
+    const detail = storedJob ?? job;
+    const partial = detail.rendered || detail.partialOutput || detail.result?.rawOutput || detail.result?.codex?.stdout || "";
+    return [`# Codex ${job.status}`, `Job: ${job.id}`, detail.errorMessage ?? job.errorMessage ?? "No successful terminal result.",
+      partial ? `\nCaptured output (may be partial):\n${partial}` : "",
+      detail.recoveryCommand ? `Recovery: ${detail.recoveryCommand}` : "",
+      detail.logFile ? `Log: ${detail.logFile}` : ""].filter(Boolean).join("\n") + "\n";
+  }
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
@@ -449,7 +461,8 @@ export function renderCancelReport(job) {
   const lines = [
     "# Codex Cancel",
     "",
-    `Cancelled ${job.id}.`,
+    job.status === "cancelled" ? `Cancelled ${job.id}.` : `Cancellation not confirmed for ${job.id} (status: ${job.status}).`,
+    ...(job.errorMessage ? [job.errorMessage] : []),
     ""
   ];
 

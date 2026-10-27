@@ -7,6 +7,7 @@
  * @typedef {import("./app-server-protocol").CodexAppServerClientOptions} CodexAppServerClientOptions
  * @typedef {import("./app-server-protocol").InitializeCapabilities} InitializeCapabilities
  */
+import { sanitizeStderr } from "./diagnostics.mjs";
 import fs from "node:fs";
 import net from "node:net";
 import process from "node:process";
@@ -14,6 +15,8 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
+import { processIdentity } from "./process-identity.mjs";
+import { processAlive } from "./atomic-store.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -92,8 +95,19 @@ class AppServerClientBase {
     this.nextId += 1;
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
-      this.sendMessage({ id, method, params });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        const error = new Error(`codex app-server ${method} control request timed out.`);
+        Object.assign(error, { code: "CONTROL_TIMEOUT" });
+        reject(error);
+      }, this.options.requestTimeoutMs ?? 60000);
+      timer.unref();
+      this.pending.set(id, {
+        resolve: value => { clearTimeout(timer); resolve(value); },
+        reject: error => { clearTimeout(timer); reject(error); }, method
+      });
+      try { this.sendMessage({ id, method, params }); }
+      catch (error) { this.pending.delete(id); clearTimeout(timer); reject(error); }
     });
   }
 
@@ -149,7 +163,8 @@ class AppServerClientBase {
     }
 
     if (message.method && this.notificationHandler) {
-      this.notificationHandler(/** @type {AppServerNotification} */ (message));
+      try { this.notificationHandler(/** @type {AppServerNotification} */ (message)); }
+      catch (error) { this.handleExit(error); }
     }
   }
 
@@ -192,9 +207,19 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
-      windowsHide: true
+      windowsHide: true,
+      detached: Boolean(this.options.ownedProcessGroup)
     });
 
+    this.processExit = new Promise(resolve => { this.proc.once("exit", resolve); this.proc.once("error", resolve); });
+
+    if (this.options.ownedProcessGroup && this.proc.pid) {
+      this.options.onProcess?.({ appServerPid: this.proc.pid, appServerIdentity: null, appServerPgid: process.platform === "win32" ? null : this.proc.pid });
+    }
+
+    this.proc.stdout.on("end", () => this.handleExit(new Error("Codex output connection closed before a terminal result.")));
+    this.proc.stdout.on("error", error => this.handleExit(error));
+    this.proc.stdin.on("error", error => this.handleExit(error));
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
 
@@ -207,7 +232,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     });
 
     this.proc.on("exit", (code, signal) => {
-      const stderr = this.stderr.trim();
+      const stderr = sanitizeStderr(this.stderr);
       const detail =
         code === 0
           ? null
@@ -227,6 +252,13 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
     });
     this.notify("initialized", {});
+    if (this.options.ownedProcessGroup && this.proc.pid) this.options.onProcess?.({ appServerPid: this.proc.pid, appServerIdentity: processIdentity(this.proc.pid), appServerPgid: process.platform === "win32" ? null : this.proc.pid });
+  }
+
+  async waitForExit(ms) {
+    let timer;
+    try { await Promise.race([this.processExit, new Promise(resolve => { timer = setTimeout(resolve, ms); })]); }
+    finally { clearTimeout(timer); }
   }
 
   async close() {
@@ -236,6 +268,25 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     }
 
     this.closed = true;
+
+    if (this.options.ownedProcessGroup && this.proc?.pid) {
+      const pid = this.proc.pid;
+      if (this.proc.exitCode === null && this.proc.signalCode === null) {
+        try { terminateProcessTree(pid, { processGroup: process.platform !== "win32" }); } catch {}
+      }
+      await this.waitForExit(500);
+      if (this.proc.exitCode === null && this.proc.signalCode === null) {
+        try { terminateProcessTree(pid, { processGroup: process.platform !== "win32", signal: "SIGKILL" }); } catch {}
+      }
+      await this.waitForExit(500);
+      this.readline?.close();
+      let groupAlive = false;
+      if (process.platform !== "win32") {
+        try { process.kill(-pid, 0); groupAlive = true; } catch (error) { if (error.code !== "ESRCH") groupAlive = true; }
+      }
+      if (processAlive(pid) || groupAlive) throw Object.assign(new Error("Private runtime termination is unconfirmed; inspect partial changes and the recorded process IDs."), { code: "TERMINATION_UNCONFIRMED" });
+      return;
+    }
 
     if (this.readline) {
       this.readline.close();
@@ -334,6 +385,7 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
 
 export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
+    options.signal?.throwIfAborted();
     let brokerEndpoint = null;
     if (!options.disableBroker) {
       brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
@@ -348,7 +400,19 @@ export class CodexAppServerClient {
     const client = brokerEndpoint
       ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
       : new SpawnedCodexAppServerClient(cwd, options);
-    await client.initialize();
-    return client;
+    let abortHandler;
+    const aborted = new Promise((_, reject) => {
+      abortHandler = () => reject(options.signal.reason ?? new Error("Runtime initialization cancelled."));
+      if (options.signal?.aborted) abortHandler();
+      else options.signal?.addEventListener("abort", abortHandler, { once: true });
+    });
+    try { await Promise.race([client.initialize(), aborted]); return client; }
+    catch (error) {
+      try { await client.close(); }
+      catch (closeError) { if (closeError.code === "TERMINATION_UNCONFIRMED") throw closeError; }
+      finally { options.onStderr?.(sanitizeStderr(client.stderr)); }
+      throw error;
+    }
+    finally { options.signal?.removeEventListener("abort", abortHandler); }
   }
 }

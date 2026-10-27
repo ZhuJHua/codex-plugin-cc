@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { atomicJson, readJson, withFileLock } from "./atomic-store.mjs";
+
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -38,9 +40,12 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
+  const stateRoot = resolveStateRoot();
   return path.join(stateRoot, `${slug}-${hash}`);
+}
+
+export function resolveStateRoot() {
+  return process.env[PLUGIN_DATA_ENV] ? path.join(process.env[PLUGIN_DATA_ENV], "state") : FALLBACK_STATE_ROOT_DIR;
 }
 
 export function resolveStateFile(cwd) {
@@ -61,64 +66,67 @@ export function loadState(cwd) {
     return defaultState();
   }
 
-  try {
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    return {
-      ...defaultState(),
-      ...parsed,
-      config: {
-        ...defaultState().config,
-        ...(parsed.config ?? {})
-      },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
-    };
-  } catch {
-    return defaultState();
-  }
+  const parsed = readJson(stateFile, defaultState());
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !Array.isArray(parsed.jobs) || parsed.jobs.some(job => !job || typeof job !== "object" || typeof job.id !== "string") || (parsed.config != null && (typeof parsed.config !== "object" || Array.isArray(parsed.config)))) throw new Error(`Invalid state structure: ${stateFile}`);
+  return {
+    ...defaultState(), ...parsed,
+    config: { ...defaultState().config, ...(parsed.config ?? {}) },
+    jobs: parsed.jobs
+  };
 }
 
-function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+export function resolveRuntimeRoot() {
+  return process.env[PLUGIN_DATA_ENV] ? path.join(process.env[PLUGIN_DATA_ENV], "runtime") : path.join(FALLBACK_STATE_ROOT_DIR, "runtime");
 }
 
-function removeFileIfExists(filePath) {
-  if (filePath && fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-  }
+export function withWorkspaceLock(cwd, fn) {
+  return withFileLock(path.join(resolveStateDir(cwd), ".transaction"), fn);
+}
+
+function saveIndex(cwd, state) {
+  ensureStateDir(cwd);
+  const sorted = [...(state.jobs ?? [])].sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
+  let retained = 0;
+  const jobs = sorted.filter(job => ["queued", "running"].includes(job.status) || retained++ < MAX_JOBS);
+  const next = { version: STATE_VERSION, config: { ...defaultState().config, ...state.config }, jobs };
+  atomicJson(resolveStateFile(cwd), next);
+  return next;
 }
 
 export function saveState(cwd, state) {
-  const previousJobs = loadState(cwd).jobs;
-  ensureStateDir(cwd);
-  const nextJobs = pruneJobs(state.jobs ?? []);
-  const nextState = {
-    version: STATE_VERSION,
-    config: {
-      ...defaultState().config,
-      ...(state.config ?? {})
-    },
-    jobs: nextJobs
-  };
-
-  const retainedIds = new Set(nextJobs.map((job) => job.id));
-  for (const job of previousJobs) {
-    if (retainedIds.has(job.id)) {
-      continue;
-    }
-    removeJobFile(resolveJobFile(cwd, job.id));
-    removeFileIfExists(job.logFile);
-  }
-
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
-  return nextState;
+  return withWorkspaceLock(cwd, () => saveIndex(cwd, state));
 }
 
 export function updateState(cwd, mutate) {
+  return withWorkspaceLock(cwd, () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveIndex(cwd, state);
+  });
+}
+
+export const terminalJob = job => ["completed", "failed", "cancelled"].includes(job?.status);
+
+// Caller already holds the workspace transaction. Job files are authoritative;
+// the index is a compact, recoverable view and never owns artifact deletion.
+export function mutateJobUnlocked(cwd, jobId, mutate) {
+  const file = resolveJobFile(cwd, jobId);
   const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  const previous = fs.existsSync(file) ? readJobFile(file) : state.jobs.find(job => job.id === jobId) ?? null;
+  const next = mutate(previous);
+  if (!next) return previous;
+  if (terminalJob(previous)) return previous;
+  const updated = { ...next, id: jobId, updatedAt: nowIso() };
+  atomicJson(file, updated);
+  const summary = { ...updated };
+  delete summary.result; delete summary.rendered; delete summary.request;
+  state.jobs = [summary, ...state.jobs.filter(job => job.id !== jobId)];
+  saveIndex(cwd, state);
+  return updated;
+}
+
+export function mutateJob(cwd, jobId, mutate) {
+  return withWorkspaceLock(cwd, () => mutateJobUnlocked(cwd, jobId, mutate));
 }
 
 export function generateJobId(prefix = "job") {
@@ -147,7 +155,16 @@ export function upsertJob(cwd, jobPatch) {
 }
 
 export function listJobs(cwd) {
-  return loadState(cwd).jobs;
+  const state = loadState(cwd);
+  const jobs = new Map(state.jobs.map(job => [job.id, job]));
+  const directory = resolveJobsDir(cwd);
+  if (fs.existsSync(directory)) {
+    for (const name of fs.readdirSync(directory).filter(name => name.endsWith(".json"))) {
+      const job = readJobFile(path.join(directory, name));
+      if (job?.id) jobs.set(job.id, { ...jobs.get(job.id), ...job });
+    }
+  }
+  return [...jobs.values()];
 }
 
 export function setConfig(cwd, key, value) {
@@ -166,12 +183,14 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  atomicJson(jobFile, payload);
   return jobFile;
 }
 
 export function readJobFile(jobFile) {
-  return JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  const job = readJson(jobFile, null);
+  if ((job === null && fs.existsSync(jobFile)) || (job !== null && (typeof job !== "object" || Array.isArray(job) || typeof job.id !== "string"))) throw new Error(`Invalid job structure: ${jobFile}`);
+  return job;
 }
 
 function removeJobFile(jobFile) {
@@ -187,5 +206,6 @@ export function resolveJobLogFile(cwd, jobId) {
 
 export function resolveJobFile(cwd, jobId) {
   ensureStateDir(cwd);
+  if (!/^[a-zA-Z0-9_-]+$/.test(jobId)) throw new Error("Invalid job ID.");
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
 }

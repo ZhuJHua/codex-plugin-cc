@@ -1,61 +1,24 @@
 ---
-description: Run a Codex code review against local git state
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]'
-disable-model-invocation: true
-allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
+description: Run the built-in Codex reviewer against local git changes
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <model|spark>]'
+allowed-tools: Bash(node:*)
 ---
 
-Run a Codex review through the shared built-in reviewer.
+Run only when the user requested this Codex review or an accepted task plan includes it. This command is review-only: do not edit files, fix findings, or add an independent Claude review.
 
-Raw slash-command arguments:
-`$ARGUMENTS`
+Original arguments:
+$ARGUMENTS
 
-Core constraint:
-- This command is review-only.
-- Do not fix issues, apply patches, or suggest that you are about to make changes.
-- Your only job is to run the review and return Codex's output verbatim to the user.
+Native review accepts working-tree or branch targets, including `--base <ref>`. It rejects custom focus text, staged-only/unstaged-only scopes, and `--effort`. Use `/codex:adversarial-review --effort <effort>` when a chosen effort or focus is required.
 
-Execution mode rules:
-- If the raw arguments include `--wait`, do not ask. Run the review in the foreground.
-- If the raw arguments include `--background`, do not ask. Run the review in a Claude background task.
-- Otherwise, estimate the review size before asking:
-  - For working-tree review, start with `git status --short --untracked-files=all`.
-  - For working-tree review, also inspect both `git diff --shortstat --cached` and `git diff --shortstat`.
-  - For base-branch review, use `git diff --shortstat <base>...HEAD`.
-  - Treat untracked files or directories as reviewable work even when `git diff --shortstat` is empty.
-  - Only conclude there is nothing to review when the relevant working-tree status is empty or the explicit branch diff is empty.
-  - Recommend waiting only when the review is clearly tiny, roughly 1-2 files total and no sign of a broader directory-sized change.
-  - In every other case, including unclear size, recommend background.
-  - When in doubt, run the review instead of declaring that there is nothing to review.
-- Then use `AskUserQuestion` exactly once with two options, putting the recommended option first and suffixing its label with `(Recommended)`:
-  - `Wait for results`
-  - `Run in background`
+Use the loaded absolute script path below; do not depend on a shell environment variable or search plugin caches. Preserve the argument string with proper shell quoting. `--raw-args` explicitly decodes slash-command controls; task/focus text remains literal after its boundary.
 
-Argument handling:
-- Preserve the user's arguments exactly.
-- Do not strip `--wait` or `--background` yourself.
-- Do not add extra review instructions or rewrite the user's intent.
-- The companion script parses `--wait` and `--background`, but Claude Code's `Bash(..., run_in_background: true)` is what actually detaches the run.
-- `/codex:review` is native-review only. It does not support staged-only review, unstaged-only review, or extra focus text.
-- If the user needs custom review instructions or more adversarial framing, they should use `/codex:adversarial-review`.
+Entry-point template only: Claude substitutes `$ARGUMENTS` in Markdown before Bash runs; it is not guaranteed to be a shell variable. Build actual Bash arguments as literal single-quoted values (escape each embedded `'` as `'\''`), or use a prompt file for task text. Never use `eval` or assume double quotes alone protect substituted text.
 
-Foreground flow:
-- Run:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review --raw-args "$ARGUMENTS"
 ```
-- Return the command stdout verbatim, exactly as-is.
-- Do not paraphrase, summarize, or add commentary before or after it.
-- Do not fix any issues mentioned in the review output.
 
-Background flow:
-- Launch the review with `Bash` in the background:
-```typescript
-Bash({
-  command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" review "$ARGUMENTS"`,
-  description: "Codex review",
-  run_in_background: true
-})
-```
-- Do not call `BashOutput` or wait for completion in this turn.
-- After launching the command, tell the user: "Codex review started in the background. Check `/codex:status` for progress."
+Wait by default, including with `--wait`. Forward `--background` only when selected; the runner owns detaching its worker. Do not wrap the companion in a second Claude background shell or infer the mode from task size.
+
+Return stdout unchanged and preserve actionable stderr on failure. A launch report is not a completed review. If the workflow needs a background result, use `/codex:await <job-id>`; never fabricate findings or claim success from the launching process exiting.

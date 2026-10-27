@@ -1,8 +1,10 @@
 {
   "name": "codex",
-  "version": "1.0.6",
+  "version": "1.1.0",
   "description": "Use Codex from Claude Code to review code or delegate tasks.",
   "author": {
-    "name": "OpenAI"
-  }
+    "name": "ZhuJHua"
+  },
+  "homepage": "https://github.com/ZhuJHua/codex-plugin-cc",
+  "repository": "https://github.com/ZhuJHua/codex-plugin-cc"
 }

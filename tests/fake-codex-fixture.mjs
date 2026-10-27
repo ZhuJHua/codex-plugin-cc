@@ -1,3 +1,4 @@
+import { testEnvironment } from "./environment.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -16,6 +17,7 @@ const readline = require("node:readline");
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const interruptibleTurns = new Map();
+	const liveThreadIds = new Set();
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
@@ -25,7 +27,9 @@ const readline = require("node:readline");
 	}
 
 function saveState(state) {
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+  const temporary = STATE_PATH + "." + process.pid + ".tmp";
+  fs.writeFileSync(temporary, JSON.stringify(state, null, 2));
+  fs.renameSync(temporary, STATE_PATH);
 }
 
 function requiresExperimental(field, message, state) {
@@ -62,6 +66,17 @@ function buildThread(thread) {
 
 function buildTurn(id, status = "inProgress", error = null) {
   return { id, status, items: [], error };
+}
+
+function buildSandboxPolicy(mode) {
+  switch (mode) {
+    case "danger-full-access":
+      return { type: "dangerFullAccess" };
+    case "workspace-write":
+      return { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false };
+    default:
+      return { type: "readOnly", networkAccess: false };
+  }
 }
 
 function buildAccountReadResult() {
@@ -190,8 +205,10 @@ function nativeReviewText(target) {
   return "Reviewed uncommitted changes.\\nNo material issues found.";
 }
 
-function structuredReviewPayload(prompt) {
-  if (prompt.includes("adversarial software review")) {
+function structuredReviewPayload() {
+    if (BEHAVIOR === "invalid-json") {
+      return "not valid json";
+    }
     if (BEHAVIOR === "adversarial-clean") {
       return JSON.stringify({
         verdict: "approve",
@@ -218,22 +235,10 @@ function structuredReviewPayload(prompt) {
       ],
       next_steps: ["Add an empty-state test."]
     });
-  }
-
-  if (BEHAVIOR === "invalid-json") {
-    return "not valid json";
-  }
-
-  return JSON.stringify({
-    verdict: "approve",
-    summary: "No material issues found.",
-    findings: [],
-    next_steps: []
-  });
 }
 
 function taskPayload(prompt, resume) {
-  if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
+  if (prompt.startsWith("Run a stop-gate review of the previous Claude turn.")) {
     if (BEHAVIOR === "adversarial-clean") {
       return "ALLOW: No blocking issues found in the previous turn.";
     }
@@ -286,8 +291,10 @@ rl.on("line", (line) => {
   try {
     switch (message.method) {
       case "initialize":
+        if (BEHAVIOR.startsWith("stderr-")) process.stderr.write(String.fromCharCode(27) + "[31mERROR rmcp::transport::worker: Transport channel closed" + String.fromCharCode(27) + "[0m\\n");
         state.capabilities = message.params.capabilities || null;
         saveState(state);
+        if (BEHAVIOR === "initialize-hangs") break;
         send({ id: message.id, result: { userAgent: "fake-codex-app-server" } });
         break;
 
@@ -305,6 +312,17 @@ rl.on("line", (line) => {
         send({ id: message.id, result: buildConfigReadResult() });
         break;
 
+      case "model/list": {
+        if (BEHAVIOR === "catalog-auth-fails") throw new Error("model catalog authentication failed");
+        if (BEHAVIOR === "catalog-unsupported") { send({ id: message.id, error: { code: -32601, message: "Unsupported method: model/list" } }); break; }
+        state.catalogRequests = (state.catalogRequests || 0) + 1;
+        saveState(state);
+        if (BEHAVIOR === "catalog-paged" && !message.params.cursor) {
+          send({ id: message.id, result: { data: [{ id: "other-model", model: "other-model", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "ultra" }] }], nextCursor: "second-page" } });
+        } else send({ id: message.id, result: { data: [{ id: "known-model", model: "known-model", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "high" }] }], nextCursor: null } });
+        break;
+      }
+
       case "thread/start": {
         if (BEHAVIOR === "auth-run-fails") {
           throw new Error("authentication expired; run codex login");
@@ -313,7 +331,12 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        thread.sandbox = buildSandboxPolicy(message.params.sandbox);
+        if (message.params.config?.["sandbox_workspace_write.network_access"] === true && thread.sandbox.type === "workspaceWrite") thread.sandbox.networkAccess = true;
+        liveThreadIds.add(thread.id);
+        state.lastThreadStart = message.params;
+        saveState(state);
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: thread.sandbox, reasoningEffort: BEHAVIOR === "capacity-rpc-once" ? "medium" : null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -346,8 +369,20 @@ rl.on("line", (line) => {
         }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
+        // Mirror servers that only apply thread/resume overrides on cold load.
+        if (!liveThreadIds.has(thread.id) && BEHAVIOR !== "live-resume-sandbox") {
+          thread.sandbox = buildSandboxPolicy(message.params.sandbox);
+        if (message.params.config?.["sandbox_workspace_write.network_access"] === true && thread.sandbox.type === "workspaceWrite") thread.sandbox.networkAccess = true;
+          liveThreadIds.add(thread.id);
+        }
+        if (BEHAVIOR === "resume-external-sandbox") {
+          thread.sandbox = { type: "externalSandbox", networkAccess: "enabled" };
+        }
+        state.lastThreadResume = message.params;
+        state.resumeHistory = [...(state.resumeHistory || []), message.params];
+        state.lastThreadResumeSandbox = thread.sandbox;
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: thread.sandbox, reasoningEffort: BEHAVIOR === "capacity-rpc-once" ? "medium" : null } });
         break;
       }
 
@@ -413,6 +448,16 @@ rl.on("line", (line) => {
         }
         const turnId = nextTurnId(state);
         send({ id: message.id, result: { turn: buildTurn(turnId), reviewThreadId: reviewThread.id } });
+        if ((BEHAVIOR === "terminal-error" || BEHAVIOR === "stderr-failed")) {
+          send({ method: "error", params: { threadId: reviewThread.id, turnId, error: { message: "review terminal failure" }, willRetry: false } });
+          break;
+        }
+        if (BEHAVIOR === "interruptible-slow-task") {
+          send({ method: "turn/started", params: { threadId: reviewThread.id, turn: buildTurn(turnId) } });
+          const timer = setTimeout(() => { interruptibleTurns.delete(turnId); emitTurnCompleted(reviewThread.id, turnId, []); }, 5000);
+          interruptibleTurns.set(turnId, { threadId: reviewThread.id, timer });
+          break;
+        }
         emitTurnCompleted(reviewThread.id, turnId, [
           {
             started: { type: "enteredReviewMode", id: turnId, review: "current changes" }
@@ -438,6 +483,12 @@ rl.on("line", (line) => {
 
 	      case "turn/start": {
 	        const thread = ensureThread(state, message.params.threadId);
+        if (BEHAVIOR === "sandbox-policy-rejected" && message.params.sandboxPolicy?.type === "dangerFullAccess") {
+          throw new Error("dangerFullAccess is not allowed by managed policy");
+        }
+        if (message.params.sandboxPolicy) {
+          thread.sandbox = message.params.sandboxPolicy;
+        }
 	        const prompt = (message.params.input || [])
           .filter((item) => item.type === "text")
           .map((item) => item.text)
@@ -449,13 +500,41 @@ rl.on("line", (line) => {
 	          turnId,
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
+            sandboxPolicy: message.params.sandboxPolicy ?? null,
+            effectiveSandbox: thread.sandbox,
+            approvalPolicy: message.params.approvalPolicy ?? null,
 	          prompt
 	        };
-	        saveState(state);
-	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+        state.turnHistory = [...(state.turnHistory || []), state.lastTurnStart];
+        saveState(state);
+        const terminalError = { message: BEHAVIOR.startsWith("capacity") ? "Selected model is at capacity" : "root terminal failure", codexErrorInfo: BEHAVIOR.startsWith("capacity") ? "serverOverloaded" : "other" };
+        if (BEHAVIOR === "capacity-rpc-once" && state.turnHistory.length === 1) {
+          fs.writeFileSync(path.join(thread.cwd, "partial-edit.txt"), "applied once");
+          send({ id: message.id, error: { code: -32000, message: "Selected model is at capacity", data: { codexErrorInfo: "serverOverloaded" } } });
+          break;
+        }
+        if (BEHAVIOR === "error-before-ack") send({ method: "error", params: { threadId: thread.id, turnId, error: terminalError, willRetry: false } });
+        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+        if ((BEHAVIOR === "terminal-error" || BEHAVIOR === "stderr-failed") || BEHAVIOR === "error-before-ack") {
+          send({ method: "error", params: { threadId: thread.id, turnId, error: terminalError, willRetry: false } });
+          break;
+        }
+        if (BEHAVIOR === "connection-death") { process.exit(17); }
+        if (BEHAVIOR === "socket-close") { process.stdout.end(); process.stdin.destroy(); break; }
+        if (BEHAVIOR === "capacity-always" || (BEHAVIOR === "capacity-once" && state.turnHistory.length === 1)) {
+          fs.writeFileSync(path.join(thread.cwd, "partial-edit.txt"), "applied once");
+          send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "partial", text: "Partial edit applied.", phase: "commentary" } } });
+          send({ method: "error", params: { threadId: thread.id, turnId, error: terminalError, willRetry: false } });
+          break;
+        }
+        if (BEHAVIOR === "retryable-error") send({ method: "error", params: { threadId: thread.id, turnId, error: terminalError, willRetry: true } });
+        if (BEHAVIOR === "subagent-error") {
+          send({ method: "thread/started", params: { thread: { id: "child", name: "helper" } } });
+          send({ method: "error", params: { threadId: "child", turnId: "child-turn", error: terminalError, willRetry: false } });
+        }
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
-          ? structuredReviewPayload(prompt)
+          ? structuredReviewPayload()
           : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
 
         if (
@@ -652,7 +731,8 @@ rl.on("line", (line) => {
 export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
-    ...process.env,
+    ...testEnvironment(),
+    CODEX_HOME: path.join(binDir, "codex-home"),
     PATH: `${binDir}${sep}${process.env.PATH}`
   };
 }

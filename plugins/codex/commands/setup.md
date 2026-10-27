@@ -6,8 +6,10 @@ allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
 
 Run:
 
+Entry-point template only: Claude substitutes `$ARGUMENTS` in Markdown before Bash runs; it is not guaranteed to be a shell variable. Build actual Bash arguments as literal single-quoted values (escape each embedded `'` as `'\''`), or use a prompt file for task text. Never use `eval` or assume double quotes alone protect substituted text.
+
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json --raw-args "$ARGUMENTS"
 ```
 
 If the result says Codex is unavailable and npm is available:
@@ -25,7 +27,7 @@ npm install -g @openai/codex
 - Then rerun:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" setup --json --raw-args "$ARGUMENTS"
 ```
 
 If Codex is already installed or npm is unavailable:

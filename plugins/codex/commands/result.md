@@ -1,15 +1,17 @@
 ---
-description: Show the stored final output for a finished Codex job in this repository
-argument-hint: '[job-id]'
-disable-model-invocation: true
+description: Show the stored final output for a Codex job
+argument-hint: '[job-id] [--json]'
 allowed-tools: Bash(node:*)
 ---
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" result "$ARGUMENTS"`
+Retrieve a completed or failed result for the current workflow or a job requested by the user.
 
-Present the full command output to the user. Do not summarize or condense it. Preserve all details including:
-- Job ID and status
-- The complete result payload, including verdict, summary, findings, details, artifacts, and next steps
-- File paths and line numbers exactly as reported
-- Any error messages or parse errors
-- Follow-up commands such as `/codex:status <id>` and `/codex:review`
+Use the loaded absolute script path; do not depend on a shell environment variable or scan plugin caches. Pass the slash arguments as one properly quoted value to the explicit raw-argument decoder.
+
+Entry-point template only: Claude substitutes `$ARGUMENTS` in Markdown before Bash runs; it is not guaranteed to be a shell variable. Build actual Bash arguments as literal single-quoted values (escape each embedded `'` as `'\''`), or use a prompt file for task text. Never use `eval` or assume double quotes alone protect substituted text.
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" result --raw-args "$ARGUMENTS"
+```
+
+Present the full runtime output unchanged. Preserve findings, uncertainty, files, verification limits, job/thread IDs, result/log paths, errors, and recovery commands. Preserve actionable stderr if invocation fails.

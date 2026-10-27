@@ -1,7 +1,10 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { resolveJobLogFile, mutateJob, terminalJob } from "./state.mjs";
+
+import { sessionHasEnded } from "./job-lifecycle.mjs";
+import { recoveryCommand } from "./recovery.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 
@@ -18,7 +21,15 @@ function normalizeProgressEvent(value) {
       turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
-      logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
+      logBody: value.logBody == null ? null : String(value.logBody).trimEnd(),
+      resolved: value.resolved,
+      diagnostic: value.diagnostic,
+      logOnly: value.logOnly,
+      partialOutput: value.partialOutput,
+      observation: value.observation,
+      appServerPid: value.appServerPid,
+      appServerIdentity: value.appServerIdentity,
+      appServerPgid: value.appServerPgid
     };
   }
 
@@ -68,49 +79,11 @@ export function createJobRecord(base, options = {}) {
 }
 
 export function createJobProgressUpdater(workspaceRoot, jobId) {
-  let lastPhase = null;
-  let lastThreadId = null;
-  let lastTurnId = null;
-
-  return (event) => {
-    const normalized = normalizeProgressEvent(event);
-    const patch = { id: jobId };
-    let changed = false;
-
-    if (normalized.phase && normalized.phase !== lastPhase) {
-      lastPhase = normalized.phase;
-      patch.phase = normalized.phase;
-      changed = true;
-    }
-
-    if (normalized.threadId && normalized.threadId !== lastThreadId) {
-      lastThreadId = normalized.threadId;
-      patch.threadId = normalized.threadId;
-      changed = true;
-    }
-
-    if (normalized.turnId && normalized.turnId !== lastTurnId) {
-      lastTurnId = normalized.turnId;
-      patch.turnId = normalized.turnId;
-      changed = true;
-    }
-
-    if (!changed) {
-      return;
-    }
-
-    upsertJob(workspaceRoot, patch);
-
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
-    }
-
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
-    });
+  return event => {
+    const value = normalizeProgressEvent(event);
+    const patch = Object.fromEntries(["phase", "threadId", "turnId", "resolved", "partialOutput", "appServerPid", "appServerPgid", "appServerIdentity"]
+      .filter(key => value[key] != null).map(key => [key, value[key]]));
+    if (Object.keys(patch).length || value.observation || value.diagnostic) mutateJob(workspaceRoot, jobId, job => job && ({ ...job, ...patch, ...(value.diagnostic ? { errorDetails: { ...job.errorDetails, ...value.diagnostic } } : {}), ...(value.observation ? { observations: [...(job.observations ?? []), value.observation] } : {}) }));
   };
 }
 
@@ -122,83 +95,51 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
   return (eventOrMessage) => {
     const event = normalizeProgressEvent(eventOrMessage);
     const stderrMessage = event.stderrMessage ?? event.message;
-    if (stderr && stderrMessage) {
-      process.stderr.write(`[codex] ${stderrMessage}\n`);
+    onEvent?.(event);
+    if (event.logOnly) {
+      appendLogLine(logFile, `[diagnostic] ${JSON.stringify(event.diagnostic)}`);
+      return;
+    }
+    if (stderr && stderrMessage && !process.stderr.destroyed) {
+      try { process.stderr.write(`[codex] ${stderrMessage}\n`); } catch {}
     }
     appendLogLine(logFile, event.message);
     appendLogBlock(logFile, event.logTitle, event.logBody);
-    onEvent?.(event);
   };
 }
 
-function readStoredJobOrNull(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
-    return null;
-  }
-  return readJobFile(jobFile);
-}
 
 export async function runTrackedJob(job, runner, options = {}) {
-  const runningRecord = {
-    ...job,
-    status: "running",
-    startedAt: nowIso(),
-    phase: "starting",
-    pid: process.pid,
-    logFile: options.logFile ?? job.logFile ?? null
-  };
-  writeJobFile(job.workspaceRoot, job.id, runningRecord);
-  upsertJob(job.workspaceRoot, runningRecord);
-
+  const running = mutateJob(job.workspaceRoot, job.id, current => ({
+    ...job, ...current, status: "running", startedAt: current?.startedAt ?? nowIso(),
+    phase: "starting", pid: process.pid, logFile: options.logFile ?? current?.logFile ?? job.logFile ?? null
+  }));
+  if (terminalJob(running)) return null;
   try {
     const execution = await runner();
-    const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
-    const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...runningRecord,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      completedAt,
-      result: execution.payload,
-      rendered: execution.rendered
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
+    const finished = mutateJob(job.workspaceRoot, job.id, current => ({
+      ...current,
+      status: (current.cancelRequestedAt || sessionHasEnded(current)) ? "cancelled" : execution.exitStatus === 0 ? "completed" : "failed",
+      phase: (current.cancelRequestedAt || sessionHasEnded(current)) ? "cancelled" : execution.exitStatus === 0 ? "done" : "failed",
+      threadId: execution.threadId ?? current.threadId ?? null,
+      turnId: execution.turnId ?? current.turnId ?? null,
+      pid: null, completedAt: nowIso(), result: execution.payload, rendered: execution.rendered,
       summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      pid: null,
-      completedAt
-    });
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
-    return execution;
+      errorMessage: (current.cancelRequestedAt || sessionHasEnded(current)) ? current.cancelReason ?? "Claude session ended." : execution.exitStatus ? execution.payload?.error?.message ?? execution.summary : null,
+      recoveryCommand: execution.exitStatus || current.cancelRequestedAt || sessionHasEnded(current) ? recoveryCommand({ ...current, threadId: execution.threadId ?? current.threadId }) : null
+    }));
+    appendLogBlock(running.logFile, "Final output", execution.rendered);
+    return { ...execution, job: finished };
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
-    const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...existing,
-      status: "failed",
-      phase: "failed",
-      errorMessage,
-      pid: null,
-      completedAt,
-      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: "failed",
-      phase: "failed",
-      pid: null,
-      errorMessage,
-      completedAt
-    });
+    const finished = mutateJob(job.workspaceRoot, job.id, current => ({
+      ...current, status: error.code === "TERMINATION_UNCONFIRMED" ? "failed" : current.cancelRequestedAt || error.code === "JOB_CANCELLED" ? "cancelled" : "failed",
+      phase: error.code === "TERMINATION_UNCONFIRMED" ? "failed" : current.cancelRequestedAt || error.code === "JOB_CANCELLED" ? "cancelled" : "failed",
+      terminationUnconfirmed: error.code === "TERMINATION_UNCONFIRMED",
+      errorDetails: { ...current.errorDetails, name: error.name, code: error.code, rpcCode: error.rpcCode, data: error.data, message: error.message },
+      errorMessage: error.code === "TERMINATION_UNCONFIRMED" ? error.message : current.cancelReason ?? error.message, pid: null, completedAt: nowIso(),
+      recoveryCommand: recoveryCommand(current)
+    }));
+    appendLogLine(running.logFile, `Failed: ${finished.errorMessage}`);
     throw error;
   }
 }

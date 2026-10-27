@@ -1,43 +1,33 @@
 ---
 name: codex-cli-runtime
-description: Internal helper contract for calling the codex-companion runtime from Claude Code
+description: Invoke the Codex companion task interface from a direct handoff or compatibility rescue agent.
 user-invocable: false
 ---
 
-# Codex Runtime
+# Codex Task Runtime
 
-Use this skill only inside the `codex:codex-rescue` subagent.
+Use the loaded absolute script path:
 
-Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...
+```
 
-Execution rules:
-- The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
-- Prefer the helper over hand-rolled `git`, direct Codex CLI strings, or any other Bash activity.
-- Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel` from `codex:codex-rescue`.
-- Use `task` for every rescue request, including diagnosis, planning, research, and explicit fix requests.
-- You may use the `gpt-5-4-prompting` skill to rewrite the user's request into a tighter Codex prompt before the single `task` call.
-- That prompt drafting is the only Claude-side work allowed. Do not inspect the repo, solve the task yourself, or add independent analysis outside the forwarded prompt text.
-- Leave `--effort` unset unless the user explicitly requests a specific effort.
-- Leave model unset by default. Add `--model` only when the user explicitly asks for one.
-- Map `spark` to `--model gpt-5.3-codex-spark`.
-- Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
+Claude substitutes this path in plugin Markdown when it loads. It is not a shell environment variable to discover. Do not scan caches, infer an installed version, or select another plugin installation.
 
-Command selection:
-- Use exactly one `task` invocation per rescue handoff.
-- If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
-- If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
-- If the forwarded request includes `--effort`, pass it through to `task`.
-- If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
-- If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
-- `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
-- `--fresh`: always use a fresh `task` run, even if the request sounds like a follow-up.
-- `--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`.
-- `task --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous rescue run.
+## Arguments
 
-Safety rules:
-- Default to write-capable Codex work in `codex:codex-rescue` unless the user explicitly asks for read-only behavior.
-- Preserve the user's task text as-is apart from stripping routing flags.
-- Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
-- Return the stdout of the `task` command exactly as-is.
-- If the Bash call fails or Codex cannot be invoked, return nothing.
+- Markdown substitutes `$ARGUMENTS` before Bash runs; the placeholder is not guaranteed to be a shell variable. The Bash blocks are entry-point templates. Encode each actual argument with reliable single quotes (escape an embedded `'` as `'\''`), or use a prompt file for task text. Never use `eval` or trust double quotes alone to protect substituted text. Content inside a real quoted shell variable is not evaluated again, but that does not make Markdown substitution safe.
+- For a slash-command argument string, use `task --raw-args "<arguments>"` and quote the entire value as data. For structured callers, pass controls as argv followed by `--` and the literal request, or use a supplied `--prompt-file`. Do not rely on automatic reparsing of a single prompt argument.
+- Preserve the complete request and agreed plan. In a resumed thread, send only the new instruction and changed constraints.
+- Leave `--model` and `--effort` unset unless selected. Pass values unchanged; the runtime resolves aliases such as `spark` and validates model capabilities.
+- `--resume` maps to `--resume-last`; `--fresh` starts a new task. Respect an explicit choice. For an unambiguous follow-up, resume unless `--fresh` was selected.
+- For authorized implementation, add `--write`; diagnosis, research, planning, or explicitly read-only requests omit it. Write capability does not authorize scope expansion.
+- Forward `--network` only when explicitly selected. It implies workspace-write and requests network access per thread/turn; writes outside allowed roots remain restricted. It cannot be combined with `--full-access`, and must not be added automatically after a failure.
+- Forward `--full-access` only when explicitly supplied before task text for this invocation. It implies write access and disables the Codex sandbox, permitting network access and writes outside the repository without approval prompts. Never infer it from earlier work or add it after a failure. A mention inside task text stays text. Report incompatible resumed permissions and the `--fresh` option instead of escalating.
+- Wait by default; `--wait` is an explicit equivalent. Forward selected `--background` to the companion. The runner creates its own private detached worker, so do not also wrap the command in a Claude background shell.
+
+## Return
+
+Invoke `task` once per handoff and relay its stdout unchanged, including job/thread IDs, result/log paths, actual status, errors, and recovery commands. Include actionable stderr on failure. A queued launch or lost observer is not completion. The main session can call `/codex:await <job-id>` when it needs the result; timeout exit 124 ends only that wait and does not cancel the job.
+
+The compatibility rescue agent does no independent repository work or polling. Closing the owning Claude session cancels its active jobs while retaining their records and logs.

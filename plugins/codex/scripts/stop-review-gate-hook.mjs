@@ -102,7 +102,7 @@ function runStopReview(cwd, input = {}) {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
+  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", "--job-timeout-ms", String(STOP_REVIEW_TIMEOUT_MS - 10000), prompt], {
     cwd,
     env: childEnv,
     encoding: "utf8",

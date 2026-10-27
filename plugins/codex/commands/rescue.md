@@ -1,49 +1,42 @@
 ---
-description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
+description: Run a Codex task or follow-up, directly from the current Claude session
+argument-hint: "[--background|--wait] [--network|--full-access] [--resume|--fresh] [--model <model|spark>] [--effort <effort>] [request]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
-Invoke the `codex:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex:codex-rescue"`), forwarding the raw user request as the prompt.
-`codex:codex-rescue` is a subagent, not a skill — do not call `Skill(codex:codex-rescue)` (no such skill) or `Skill(codex:rescue)` (that re-enters this command and hangs the session). The command runs inline so the `Agent` tool stays in scope; forked general-purpose subagents do not expose it.
-The final user-visible response must be Codex's output verbatim.
+Run the companion directly from the current Claude session by default. This avoids a forwarding-agent call for ordinary handoffs. Preserve the request, agreed plan, relevant context, and acceptance criteria; do not inspect the repository or replan the task before dispatch. Ask what Codex should do if no task was supplied.
 
-Raw user request:
+Original request:
 $ARGUMENTS
 
-Execution mode:
+Use the absolute script path substituted into this Markdown when the plugin loads. Do not depend on a `CLAUDE_PLUGIN_ROOT` shell environment variable or scan plugin caches or installation registries.
 
-- If the request includes `--background`, run the `codex:codex-rescue` subagent in the background.
-- If the request includes `--wait`, run the `codex:codex-rescue` subagent in the foreground.
-- If neither flag is present, default to foreground.
-- `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
-- `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
-- If the request includes `--resume`, do not ask whether to continue. The user already chose.
-- If the request includes `--fresh`, do not ask whether to continue. The user already chose.
-- Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:
+Entry-point template only: Claude substitutes `$ARGUMENTS` in Markdown before Bash runs; it is not guaranteed to be a shell variable. Build actual Bash arguments as literal single-quoted values (escape each embedded `'` as `'\''`), or use a prompt file for task text. Never use `eval` or assume double quotes alone protect substituted text.
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --raw-args "$ARGUMENTS"
+```
+
+`--raw-args` explicitly decodes slash-command arguments. Quote its value as one shell argument; do not execute the request as shell code. For an authorized implementation, add `--write` before `--raw-args` unless `--full-access` was supplied. For diagnosis, planning, research, or explicitly read-only work, omit `--write`. When adding agreed context, pass the complete request as literal argv after `--`, or use an existing `--prompt-file`; do not silently reinterpret prompt text as flags.
+
+## Controls
+
+- Forward `--network` only when explicitly selected. It enables workspace-write with networking, including permitted loopback sockets, while retaining filesystem restrictions. It implies write and cannot be combined with `--full-access`. Never add either permission flag merely to recover from a failure.
+
+- Wait for the result by default, including when `--wait` is supplied. Forward `--background` to the companion only when the user selected it; the runner owns background execution. Do not also put the companion inside a Claude background shell to detach it.
+- Preserve selected `--model` and `--effort`; leave them unset otherwise. The runtime resolves aliases and validates model capabilities.
+- Forward `--full-access` only when explicitly supplied before the task text for this invocation. It disables the Codex sandbox and permits network access and writes outside the repository without approval prompts. Never infer it from an earlier task or add it after a failure; mentions inside task text remain text.
+- Honor `--resume` and `--fresh`. The runtime maps `--resume` to `--resume-last`; use only the new instruction when continuing a thread. For an unambiguous follow-up, resume; for clearly independent work, start fresh.
+- If the relationship to earlier work is genuinely ambiguous, query the helper below. If `available: true`, ask once whether to continue or start fresh. Do not repeat an already resolved choice.
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate --json
 ```
 
-- If that helper reports `available: true`, use `AskUserQuestion` exactly once to ask whether to continue the current Codex thread or start a new one.
-- The two choices must be:
-  - `Continue current Codex thread`
-  - `Start a new Codex thread`
-- If the user is clearly giving a follow-up instruction such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", put `Continue current Codex thread (Recommended)` first.
-- Otherwise put `Start a new Codex thread (Recommended)` first.
-- If the user chooses continue, add `--resume` before routing to the subagent.
-- If the user chooses a new thread, add `--fresh` before routing to the subagent.
-- If the helper reports `available: false`, do not ask. Route normally.
+## Parallel or isolated handoffs
 
-Operating rules:
+Keep `Agent(subagent_type: "codex:codex-rescue")` as a compatibility option for independent parallel tasks or useful context isolation. Include the complete task and applicable controls in its prompt. It invokes the same runner and follows the same permission, wait, and result rules as the direct path. Keep this command inline; do not use `context: fork`, call `Skill(codex:codex-rescue)`, or recursively invoke `Skill(codex:rescue)`.
 
-- The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...` and return that command's stdout as-is.
-- Return the Codex companion stdout verbatim to the user.
-- Do not paraphrase, summarize, rewrite, or add commentary before or after it.
-- Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
-- Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
-- Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
-- Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
-- If the helper reports that Codex is missing or unauthenticated, stop and tell the user to run `/codex:setup`.
-- If the user did not supply a request, ask what Codex should investigate or fix.
+## Results
+
+Return companion output unchanged, preserving job IDs, result/log paths, and recovery commands. A background launch or an interrupted observer is not completion. When the current workflow needs the result, use `/codex:await <job-id>`; otherwise report the launch and continue independent work. Preserve actual failure output, including actionable stderr. Direct missing setup/authentication to `/codex:setup`.

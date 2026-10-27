@@ -1,19 +1,19 @@
 {
-  "name": "openai-codex",
+  "name": "zhujhua-codex",
   "owner": {
-    "name": "OpenAI"
+    "name": "ZhuJHua"
   },
   "metadata": {
-    "description": "Codex plugins to use in Claude Code for delegation and code review.",
-    "version": "1.0.6"
+    "description": "Codex delegation and review for Claude Code, maintained by ZhuJHua from the OpenAI plugin.",
+    "version": "1.1.0"
   },
   "plugins": [
     {
       "name": "codex",
       "description": "Use Codex from Claude Code to review code or delegate tasks.",
-      "version": "1.0.6",
+      "version": "1.1.0",
       "author": {
-        "name": "OpenAI"
+        "name": "ZhuJHua"
       },
       "source": "./plugins/codex"
     }

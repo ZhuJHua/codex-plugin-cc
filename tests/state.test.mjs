@@ -1,3 +1,4 @@
+import "./environment.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -40,7 +41,7 @@ test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
   }
 });
 
-test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", () => {
+test("saveState caps its index while retaining dropped job artifacts", () => {
   const workspace = makeTempDir();
   const stateFile = resolveStateFile(workspace);
   fs.mkdirSync(path.dirname(stateFile), { recursive: true });
@@ -98,8 +99,28 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
   );
   assert.deepEqual(
     fs.readdirSync(jobsDir).sort(),
-    Array.from({ length: 50 }, (_, index) => `job-${index + 1}`)
+    Array.from({ length: 51 }, (_, index) => `job-${index}`)
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test('job files reconstruct queries when the workspace index is missing', async () => {
+  const { listJobs, mutateJob } = await import('../plugins/codex/scripts/lib/state.mjs');
+  const workspace = makeTempDir();
+  mutateJob(workspace, 'retained', () => ({ id: 'retained', status: 'completed', title: 'Retained result', result: { rawOutput: 'done' } }));
+  fs.unlinkSync(resolveStateFile(workspace));
+  assert.equal(listJobs(workspace)[0].result.rawOutput, 'done');
+});
+
+test('malformed state and job structures fail explicitly instead of clearing history', async () => {
+  const { loadState, listJobs } = await import('../plugins/codex/scripts/lib/state.mjs');
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  fs.writeFileSync(stateFile, '{"jobs":[null]}');
+  assert.throws(() => loadState(workspace), /Invalid state structure/);
+  fs.unlinkSync(stateFile);
+  fs.writeFileSync(resolveJobFile(workspace, 'broken'), 'null');
+  assert.throws(() => listJobs(workspace), /Invalid job structure/);
 });

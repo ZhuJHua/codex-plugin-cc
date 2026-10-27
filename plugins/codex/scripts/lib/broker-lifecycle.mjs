@@ -6,6 +6,7 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
+import { terminateProcessTree } from "./process.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
@@ -148,6 +149,13 @@ export async function ensureBrokerSession(cwd, options = {}) {
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
+    if (child.pid) {
+      try { terminateProcessTree(child.pid); } catch {}
+      await new Promise(resolve => setTimeout(resolve, 100));
+      if (child.exitCode === null && child.signalCode === null) {
+        try { terminateProcessTree(child.pid, { signal: "SIGKILL" }); } catch {}
+      }
+    }
     teardownBrokerSession({
       endpoint,
       pidFile,
