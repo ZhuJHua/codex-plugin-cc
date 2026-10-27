@@ -41,8 +41,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
-import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
-import { loadBrokerSession } from "./broker-lifecycle.mjs";
+import { CodexAppServerClient } from "./app-server.mjs";
 import { binaryAvailable } from "./process.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
@@ -621,39 +620,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 }
 
 async function withAppServer(cwd, fn, options = {}) {
-  if (options.disableBroker) return withDirectAppServer(cwd, fn, options);
-  let client = null;
-  try {
-    client = await CodexAppServerClient.connect(cwd);
-    const result = await fn(client);
-    await client.close();
-    return result;
-  } catch (error) {
-    const brokerRequested = client?.transport === "broker" || Boolean(process.env[BROKER_ENDPOINT_ENV]);
-    const shouldRetryDirect =
-      (client?.transport === "broker" && error?.rpcCode === BROKER_BUSY_RPC_CODE) ||
-      (brokerRequested && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED"));
-
-    if (client) {
-      await client.close().catch(() => {});
-      client = null;
-    }
-
-    if (!shouldRetryDirect) {
-      throw error;
-    }
-
-    const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
-    try {
-      return await fn(directClient);
-    } finally {
-      await directClient.close();
-    }
-  }
-}
-
-async function withDirectAppServer(cwd, fn, options = {}) {
-  const client = await CodexAppServerClient.connect(cwd, { ...options, disableBroker: true });
+  const client = await CodexAppServerClient.connect(cwd, options);
   try {
     return await fn(client);
   } finally {
@@ -931,22 +898,11 @@ export function getCodexAvailability(cwd) {
   };
 }
 
-export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
-  const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
-  if (endpoint) {
-    return {
-      mode: "shared",
-      label: "shared session",
-      detail: "This Claude session is configured to reuse one shared Codex runtime.",
-      endpoint
-    };
-  }
-
+export function getSessionRuntimeStatus() {
   return {
     mode: "direct",
-    label: "direct startup",
-    detail: "Tracked jobs use independent private runtimes. No legacy shared runtime is recorded.",
-    endpoint: null
+    label: "private per-job",
+    detail: "Each operation owns an independent Codex app-server and closes it when finished."
   };
 }
 
@@ -965,65 +921,14 @@ export async function getCodexAuthStatus(cwd, options = {}) {
     };
   }
 
-  let client = null;
   try {
-    client = await CodexAppServerClient.connect(cwd, {
-      env: options.env,
-      reuseExistingBroker: true
-    });
-    return await getCodexAuthStatusFromClient(client, cwd);
+    return await withAppServer(cwd, client => getCodexAuthStatusFromClient(client, cwd), { env: options.env });
   } catch (error) {
     return buildAuthStatus({
       loggedIn: false,
       detail: error instanceof Error ? error.message : String(error),
       source: "app-server"
     });
-  } finally {
-    if (client) {
-      await client.close().catch(() => {});
-    }
-  }
-}
-
-export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
-  if (!threadId || !turnId) {
-    return {
-      attempted: false,
-      interrupted: false,
-      transport: null,
-      detail: "missing threadId or turnId"
-    };
-  }
-
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    return {
-      attempted: false,
-      interrupted: false,
-      transport: null,
-      detail: availability.detail
-    };
-  }
-
-  let client = null;
-  try {
-    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
-    await client.request("turn/interrupt", { threadId, turnId });
-    return {
-      attempted: true,
-      interrupted: true,
-      transport: client.transport,
-      detail: `Interrupted ${turnId} on ${threadId}.`
-    };
-  } catch (error) {
-    return {
-      attempted: true,
-      interrupted: false,
-      transport: client?.transport ?? null,
-      detail: error instanceof Error ? error.message : String(error)
-    };
-  } finally {
-    await client?.close().catch(() => {});
   }
 }
 
@@ -1063,11 +968,10 @@ function resolvedThread(response) {
   };
 }
 
-function privateClientOptions(options) {
+function clientOptions(options) {
   return {
     signal: options.signal,
     onStderr: stderr => { if (stderr) options.onProgress?.({ diagnostic: { stderr }, logOnly: true }); },
-    disableBroker: Boolean(options.privateRuntime), ownedProcessGroup: Boolean(options.privateRuntime),
     onProcess: update => emitProgress(options.onProgress, update.appServerIdentity ? "Private runtime identity recorded." : "Private Codex runtime started.", "starting", update)
   };
 }
@@ -1131,7 +1035,7 @@ export async function runAppServerReview(cwd, options = {}) {
       error: turnState.error,
       stderr: cleanCodexStderr(client.stderr)
     };
-  }, privateClientOptions(options));
+  }, clientOptions(options));
 }
 
 export async function importExternalAgentSession(cwd, options = {}) {
@@ -1143,7 +1047,7 @@ export async function importExternalAgentSession(cwd, options = {}) {
     throw new Error("A Claude session source path is required.");
   }
 
-  return withDirectAppServer(cwd, async (client) => {
+  return withAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Importing Claude session into Codex.", "transferring");
     try {
       await requestExternalAgentSessionImport(client, externalAgentSessionMigration(options.sourcePath, cwd));
@@ -1257,7 +1161,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
       commandExecutions: turnState.commandExecutions
     };
-  }, privateClientOptions(options));
+  }, clientOptions(options));
 }
 
 export async function findLatestTaskThread(cwd) {
@@ -1266,7 +1170,7 @@ export async function findLatestTaskThread(cwd) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
-  return withDirectAppServer(cwd, async (client) => {
+  return withAppServer(cwd, async (client) => {
     const response = await client.request("thread/list", {
       cwd,
       limit: 20,

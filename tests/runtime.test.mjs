@@ -9,7 +9,6 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
-import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 import { processIdentity } from "../plugins/codex/scripts/lib/process-identity.mjs";
 
@@ -1149,7 +1148,7 @@ test("task uses a private runtime and completes when Codex spawns subagents", ()
   });
   assert.equal(review.status, 0, review.stderr);
 
-  assert.equal(loadBrokerSession(repo), null);
+  assert.equal(fs.existsSync(path.join(resolveStateDir(repo), "broker.json")), false);
 
   const result = run("node", [SCRIPT, "task", "challenge the current design"], {
     cwd: repo,
@@ -1459,7 +1458,7 @@ test("status shows phases, hints, and the latest finished job", () => {
   assert.match(result.stdout, /Live details:/);
   assert.match(result.stdout, /Latest finished:/);
   assert.match(result.stdout, /Progress:/);
-  assert.match(result.stdout, /Session runtime: direct startup/);
+  assert.match(result.stdout, /Session runtime: private per-job/);
   assert.match(result.stdout, /Phase: reviewing/);
   assert.match(result.stdout, /Codex session ID: thr_1/);
   assert.match(result.stdout, /Resume in Codex: codex resume thr_1/);
@@ -2228,7 +2227,6 @@ test("session end cancels owner work and preserves records and logs", async (t) 
   // Job artifacts are authoritative; keep the index and artifacts consistent.
   const seeded = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   for (const job of seeded.jobs) fs.writeFileSync(path.join(jobsDir, `${job.id}.json`), JSON.stringify({ ...job, workspaceRoot: repo }));
-  saveBrokerSession(repo, { endpoint: "unix:/tmp/retained-legacy-session.sock" });
   const result = await runAsync("node", [SESSION_HOOK, "SessionEnd"], {
     cwd: repo,
     env: {
@@ -2243,7 +2241,6 @@ test("session end cancels owner work and preserves records and logs", async (t) 
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(loadBrokerSession(repo).endpoint, "unix:/tmp/retained-legacy-session.sock");
   assert.equal(fs.readFileSync(completedLog, "utf8"), "completed\n");
   assert.equal(fs.readFileSync(runningLog, "utf8"), "running\n");
   assert.equal(fs.existsSync(otherSessionLog), true);
@@ -2484,7 +2481,7 @@ test("commands start an independent app-server for each tracked job", async () =
   });
   assert.equal(review.status, 0, review.stderr);
 
-  assert.equal(loadBrokerSession(repo), null);
+  assert.equal(fs.existsSync(path.join(resolveStateDir(repo), "broker.json")), false);
 
   const adversarial = run("node", [SCRIPT, "adversarial-review"], {
     cwd: repo,
@@ -2526,7 +2523,7 @@ test("setup independently checks readiness after a private task runtime exits", 
   });
   assert.equal(review.status, 0, review.stderr);
 
-  assert.equal(loadBrokerSession(repo), null);
+  assert.equal(fs.existsSync(path.join(resolveStateDir(repo), "broker.json")), false);
 
   const setup = run("node", [SCRIPT, "setup", "--json"], {
     cwd: repo,
@@ -2548,33 +2545,44 @@ test("setup independently checks readiness after a private task runtime exits", 
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("status reports a legacy shared runtime when its broker record exists", () => {
+test("obsolete shared connection settings cannot redirect setup or tasks", () => {
   const repo = makeTempDir();
-  saveBrokerSession(repo, { endpoint: "unix:/tmp/legacy-runtime-test.sock" });
-  const result = run("node", [SCRIPT, "status"], { cwd: repo });
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Session runtime: shared session/);
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "broker.json"), "invalid retired state");
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_APP_SERVER_ENDPOINT: "unix:/unavailable-shared-runtime.sock" };
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(JSON.parse(status.stdout).sessionRuntime.label, "private per-job");
+  const setup = run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env });
+  assert.equal(setup.status, 0, setup.stderr);
+  assert.equal(JSON.parse(setup.stdout).ready, true);
+  assert.equal(Object.hasOwn(JSON.parse(setup.stdout).sessionRuntime, "endpoint"), false);
+  const task = run("node", [SCRIPT, "task", "--json", "inspect"], { cwd: repo, env });
+  assert.equal(task.status, 0, task.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8")).appServerStarts, 2);
 });
 
-test("setup and status honor --cwd when reading shared session runtime", () => {
+test("setup and status honor --cwd for independent runtime configuration", () => {
   const targetWorkspace = makeTempDir();
   const invocationWorkspace = makeTempDir();
-
-  saveBrokerSession(targetWorkspace, {
-    endpoint: "unix:/tmp/fake-broker.sock"
-  });
-
-  const status = run("node", [SCRIPT, "status", "--cwd", targetWorkspace], {
-    cwd: invocationWorkspace
-  });
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir);
+  const stateDir = resolveStateDir(targetWorkspace);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify({ version: 1, config: { stopReviewGate: true }, jobs: [] }));
+  const status = run("node", [SCRIPT, "status", "--cwd", targetWorkspace], { cwd: invocationWorkspace, env });
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /Session runtime: shared session/);
-
-  const setup = run("node", [SCRIPT, "setup", "--cwd", targetWorkspace, "--json"], {
-    cwd: invocationWorkspace
-  });
+  assert.match(status.stdout, /Session runtime: private per-job/);
+  assert.match(status.stdout, /Review gate: enabled/);
+  const setup = run("node", [SCRIPT, "setup", "--cwd", targetWorkspace, "--json"], { cwd: invocationWorkspace, env });
   assert.equal(setup.status, 0, setup.stderr);
   const payload = JSON.parse(setup.stdout);
-  assert.equal(payload.sessionRuntime.mode, "shared");
-  assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+  assert.equal(payload.sessionRuntime.mode, "direct");
+  assert.equal(payload.reviewGateEnabled, true);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(fakeState.lastConfigRead.cwd, targetWorkspace);
 });

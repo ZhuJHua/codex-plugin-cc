@@ -9,21 +9,15 @@
  */
 import { sanitizeStderr } from "./diagnostics.mjs";
 import fs from "node:fs";
-import net from "node:net";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
-import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { processIdentity } from "./process-identity.mjs";
 import { processAlive } from "./atomic-store.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
-
-export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
-export const BROKER_BUSY_RPC_CODE = -32001;
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -57,7 +51,7 @@ function createProtocolError(message, data) {
   return error;
 }
 
-class AppServerClientBase {
+export class CodexAppServerClient {
   constructor(cwd, options = {}) {
     this.cwd = cwd;
     this.options = options;
@@ -68,8 +62,7 @@ class AppServerClientBase {
     this.exitError = null;
     /** @type {AppServerNotificationHandler | null} */
     this.notificationHandler = null;
-    this.lineBuffer = "";
-    this.transport = "unknown";
+    this.transport = "direct";
 
     this.exitPromise = new Promise((resolve) => {
       this.resolveExit = resolve;
@@ -116,17 +109,6 @@ class AppServerClientBase {
       return;
     }
     this.sendMessage({ method, params });
-  }
-
-  handleChunk(chunk) {
-    this.lineBuffer += chunk;
-    let newlineIndex = this.lineBuffer.indexOf("\n");
-    while (newlineIndex !== -1) {
-      const line = this.lineBuffer.slice(0, newlineIndex);
-      this.lineBuffer = this.lineBuffer.slice(newlineIndex + 1);
-      this.handleLine(line);
-      newlineIndex = this.lineBuffer.indexOf("\n");
-    }
   }
 
   handleLine(line) {
@@ -190,17 +172,6 @@ class AppServerClientBase {
     this.resolveExit(undefined);
   }
 
-  sendMessage(_message) {
-    throw new Error("sendMessage must be implemented by subclasses.");
-  }
-}
-
-class SpawnedCodexAppServerClient extends AppServerClientBase {
-  constructor(cwd, options = {}) {
-    super(cwd, options);
-    this.transport = "direct";
-  }
-
   async initialize() {
     this.proc = spawn("codex", ["app-server"], {
       cwd: this.cwd,
@@ -208,12 +179,12 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       stdio: ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
       windowsHide: true,
-      detached: Boolean(this.options.ownedProcessGroup)
+      detached: true
     });
 
     this.processExit = new Promise(resolve => { this.proc.once("exit", resolve); this.proc.once("error", resolve); });
 
-    if (this.options.ownedProcessGroup && this.proc.pid) {
+    if (this.proc.pid) {
       this.options.onProcess?.({ appServerPid: this.proc.pid, appServerIdentity: null, appServerPgid: process.platform === "win32" ? null : this.proc.pid });
     }
 
@@ -252,7 +223,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
     });
     this.notify("initialized", {});
-    if (this.options.ownedProcessGroup && this.proc.pid) this.options.onProcess?.({ appServerPid: this.proc.pid, appServerIdentity: processIdentity(this.proc.pid), appServerPgid: process.platform === "win32" ? null : this.proc.pid });
+    if (this.proc.pid) this.options.onProcess?.({ appServerPid: this.proc.pid, appServerIdentity: processIdentity(this.proc.pid), appServerPgid: process.platform === "win32" ? null : this.proc.pid });
   }
 
   async waitForExit(ms) {
@@ -269,7 +240,7 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
     this.closed = true;
 
-    if (this.options.ownedProcessGroup && this.proc?.pid) {
+    if (this.proc?.pid) {
       const pid = this.proc.pid;
       if (this.proc.exitCode === null && this.proc.signalCode === null) {
         try { terminateProcessTree(pid, { processGroup: process.platform !== "win32" }); } catch {}
@@ -288,32 +259,8 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       return;
     }
 
-    if (this.readline) {
-      this.readline.close();
-    }
-
-    if (this.proc && !this.proc.killed) {
-      this.proc.stdin.end();
-      setTimeout(() => {
-        if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
-          // On Windows with shell: true, the direct child is cmd.exe.
-          // Use terminateProcessTree to kill the entire tree including
-          // the grandchild node process.
-          if (process.platform === "win32") {
-            try {
-              terminateProcessTree(this.proc.pid);
-            } catch {
-              // Best-effort cleanup inside an unref'd timer — swallow errors
-              // to avoid crashing the host process during shutdown.
-            }
-          } else {
-            this.proc.kill("SIGTERM");
-          }
-        }
-      }, 50).unref?.();
-    }
-
-    await this.exitPromise;
+    this.readline?.close();
+    await this.processExit;
   }
 
   sendMessage(message) {
@@ -324,82 +271,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     }
     stdin.write(line);
   }
-}
 
-class BrokerCodexAppServerClient extends AppServerClientBase {
-  constructor(cwd, options = {}) {
-    super(cwd, options);
-    this.transport = "broker";
-    this.endpoint = options.brokerEndpoint;
-  }
-
-  async initialize() {
-    await new Promise((resolve, reject) => {
-      const target = parseBrokerEndpoint(this.endpoint);
-      this.socket = net.createConnection({ path: target.path });
-      this.socket.setEncoding("utf8");
-      this.socket.on("connect", resolve);
-      this.socket.on("data", (chunk) => {
-        this.handleChunk(chunk);
-      });
-      this.socket.on("error", (error) => {
-        if (!this.exitResolved) {
-          reject(error);
-        }
-        this.handleExit(error);
-      });
-      this.socket.on("close", () => {
-        this.handleExit(this.exitError);
-      });
-    });
-
-    await this.request("initialize", {
-      clientInfo: this.options.clientInfo ?? DEFAULT_CLIENT_INFO,
-      capabilities: this.options.capabilities ?? DEFAULT_CAPABILITIES
-    });
-    this.notify("initialized", {});
-  }
-
-  async close() {
-    if (this.closed) {
-      await this.exitPromise;
-      return;
-    }
-
-    this.closed = true;
-    if (this.socket) {
-      this.socket.end();
-    }
-    await this.exitPromise;
-  }
-
-  sendMessage(message) {
-    const line = `${JSON.stringify(message)}\n`;
-    const socket = this.socket;
-    if (!socket) {
-      throw new Error("codex app-server broker connection is not connected.");
-    }
-    socket.write(line);
-  }
-}
-
-export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
     options.signal?.throwIfAborted();
-    let brokerEndpoint = null;
-    if (!options.disableBroker) {
-      brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
-      if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
-      }
-      if (!brokerEndpoint && !options.reuseExistingBroker) {
-        const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
-        brokerEndpoint = brokerSession?.endpoint ?? null;
-      }
-    }
-    const client = brokerEndpoint
-      ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
-      : new SpawnedCodexAppServerClient(cwd, options);
+    const client = new CodexAppServerClient(cwd, options);
     let abortHandler;
     const aborted = new Promise((_, reject) => {
       abortHandler = () => reject(options.signal.reason ?? new Error("Runtime initialization cancelled."));

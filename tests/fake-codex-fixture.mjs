@@ -306,6 +306,8 @@ rl.on("line", (line) => {
         break;
 
       case "config/read":
+        state.lastConfigRead = message.params;
+        saveState(state);
         if (BEHAVIOR === "config-read-fails") {
           throw new Error("config/read failed for cwd");
         }

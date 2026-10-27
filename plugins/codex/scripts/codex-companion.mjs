@@ -204,7 +204,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     npm: npmStatus,
     codex: codexStatus,
     auth: authStatus,
-    sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
+    sessionRuntime: getSessionRuntimeStatus(),
     reviewGateEnabled: Boolean(config.stopReviewGate),
     actionsTaken,
     nextSteps
@@ -369,7 +369,7 @@ async function executeReviewRun(request) {
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
-      privateRuntime: true, signal: request.signal,
+      signal: request.signal,
       onProgress: request.onProgress
     });
     const payload = {
@@ -412,7 +412,7 @@ async function executeReviewRun(request) {
   const result = await runAppServerTurn(context.repoRoot, {
     prompt,
     model: request.model,
-    effort: request.effort, privateRuntime: true, signal: request.signal,
+    effort: request.effort, signal: request.signal,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress
@@ -500,7 +500,7 @@ async function executeTaskRun(request) {
           ? interpolateTemplate(loadPromptTemplate(ROOT_DIR, "task").replace(/\r?\n$/, ""), { TASK_REQUEST: request.prompt }) : request.prompt,
       defaultPrompt: DEFAULT_CONTINUE_PROMPT,
       model, effort, modelProvider, sandboxPolicy: frozenSandboxPolicy, approvalPolicy: frozenApprovalPolicy, network: request.network, sandbox: resolveTaskSandbox(request),
-      privateRuntime: true, signal: request.signal, onProgress: request.onProgress,
+      signal: request.signal, onProgress: request.onProgress,
       persistThread: true,
       threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
     }); } catch (error) {

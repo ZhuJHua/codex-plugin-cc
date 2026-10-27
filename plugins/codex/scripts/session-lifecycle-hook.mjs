@@ -62,8 +62,6 @@ async function handleSessionEnd(input) {
   if (failures.length) {
     throw new Error(`Session cleanup incomplete:\n${failures.join("\n")}`);
   }
-  // Keep results and recovery handles. Legacy workspace brokers may serve
-  // other sessions, so this hook must not shut down or delete their state.
 }
 
 async function main() {

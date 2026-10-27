@@ -10,17 +10,9 @@ import { spawnSync } from "node:child_process";
 const temporaryDirectories = new Set();
 after(async () => {
   const { resolveStateDir } = await import("../plugins/codex/scripts/lib/state.mjs");
-  const { loadBrokerSession, sendBrokerShutdown, teardownBrokerSession } = await import("../plugins/codex/scripts/lib/broker-lifecycle.mjs");
   const { stopOwnedProcesses } = await import("../plugins/codex/scripts/lib/job-lifecycle.mjs");
   for (const directory of temporaryDirectories) {
     const stateDir = resolveStateDir(directory);
-    const broker = loadBrokerSession(directory);
-    if (broker) {
-      let timer;
-      await Promise.race([sendBrokerShutdown(broker.endpoint), new Promise(resolve => { timer = setTimeout(resolve, 500); })]);
-      clearTimeout(timer);
-      teardownBrokerSession({ ...broker, killProcess: pid => { try { process.kill(-pid, "SIGTERM"); } catch {} } });
-    }
     const jobsDir = path.join(stateDir, "jobs");
     if (fs.existsSync(jobsDir)) for (const file of fs.readdirSync(jobsDir).filter(file => file.endsWith(".json"))) {
       try {

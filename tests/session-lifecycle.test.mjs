@@ -100,7 +100,6 @@ test("SessionEnd cancels owner jobs across working directories and retains artif
   const worker = f.child(second);
   const appServer = f.child(second);
   const otherOwner = f.child(first);
-  const oldBroker = f.child(first);
   const [workerIdentity, appServerIdentity] = await Promise.all([worker, appServer].map(async child => {
     await once(child, "spawn");
     const identity = processIdentity(child.pid);
@@ -122,9 +121,6 @@ test("SessionEnd cancels owner jobs across working directories and retains artif
   putJob(first, "other-owner", { sessionId: "owner-b", status: "running", pid: otherOwner.pid });
   putJob(first, "completed-owner", { status: "completed", result: { rawOutput: "finished result" } });
   const completedBefore = fs.readFileSync(resolveJobFile(first, "completed-owner"), "utf8");
-  const brokerFile = path.join(resolveStateDir(first), "broker.json");
-  const brokerContents = JSON.stringify({ pid: oldBroker.pid, endpoint: "unix:/unused-broker.sock" });
-  fs.writeFileSync(brokerFile, brokerContents);
 
   const result = await runHook({ cwd: first, session_id: "owner-a" }, { CODEX_COMPANION_SESSION_ID: "owner-b" });
   assert.equal(result.code, 0, result.stderr);
@@ -140,8 +136,6 @@ test("SessionEnd cancels owner jobs across working directories and retains artif
   assert.equal(fs.readFileSync(resolveJobFile(first, "completed-owner"), "utf8"), completedBefore);
   assert.equal(readJob(first, "other-owner").status, "running");
   assert.equal(processAlive(otherOwner.pid), true);
-  assert.equal(processAlive(oldBroker.pid), true);
-  assert.equal(fs.readFileSync(brokerFile, "utf8"), brokerContents);
   assert.equal(processAlive(worker.pid), false);
   assert.equal(processAlive(appServer.pid), false);
 });

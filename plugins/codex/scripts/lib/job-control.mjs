@@ -237,7 +237,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
   return {
     workspaceRoot,
     config,
-    sessionRuntime: getSessionRuntimeStatus(options.env, workspaceRoot),
+    sessionRuntime: getSessionRuntimeStatus(),
     running,
     latestFinished,
     recent,

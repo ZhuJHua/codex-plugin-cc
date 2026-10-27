@@ -392,3 +392,5 @@ If you need to point the built-in OpenAI provider at a different endpoint, set `
 Execution state, recovery boundaries, and the paired live evaluation procedure are documented in [docs/reliability.md](docs/reliability.md).
 
 For development, tests isolate Claude session/plugin variables and verify that no processes associated with the current run's temporary roots survive teardown. Both `npm test` and `CODEX_COMPANION_SESSION_ID=ended-x CLAUDE_PLUGIN_DATA=/tmp/x npm test` must pass; the process audit requires permission to inspect the process table.
+
+Each operation owns its Codex app-server through stdio, including setup's temporary authentication check. Status displays `private per-job`. Shared daemon transports and their endpoint/state configuration are not supported.
