@@ -1119,10 +1119,11 @@ export async function runAppServerTurn(cwd, options = {}) {
       if (resolved.sandbox?.type !== "workspaceWrite") throw new Error("--network requires a workspaceWrite sandbox response.");
       turnSandboxPolicy = { ...(turnSandboxPolicy ?? resolved.sandbox), type: "workspaceWrite", networkAccess: true };
     }
-    const prompt = options.prompt || options.defaultPrompt || "";
-    if (!prompt) {
+    const rawPrompt = options.prompt || options.defaultPrompt || "";
+    if (!rawPrompt) {
       throw new Error("A prompt is required for this Codex run.");
     }
+    const prompt = options.formatPrompt ? options.formatPrompt(rawPrompt, resolved) : rawPrompt;
 
     const turnState = await captureTurn(
       client,

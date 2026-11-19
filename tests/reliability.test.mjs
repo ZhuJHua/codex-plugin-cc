@@ -327,6 +327,30 @@ test('task argv preserves the complete literal request, including whitespace and
   assert.equal(filePrompt.slice(filePrompt.indexOf('\nRequest:\n') + '\nRequest:\n'.length), request);
 });
 
+test('fresh tasks use the resolved model guidance and resumed tasks send only the delta', testContext => {
+  const testFixture = fixture(testContext, 'gpt-6.2-default');
+  const initial = testFixture.cli(['task', '--json', 'Check the configured model']);
+  assert.equal(initial.status, 0, initial.stderr);
+  const initialState = testFixture.state();
+  assert.equal(initialState.lastThreadStart.model, null);
+  assert.equal(initialState.lastTurnStart.model, null);
+  assert.equal(initialState.lastTurnStart.effort, null);
+  assert.match(initialState.lastTurnStart.prompt, /reasonable, reversible assumptions/);
+
+  const model = 'gpt-6.1-sol';
+  const explicit = testFixture.cli(['task', '--json', '--model', model, '--effort', 'high', 'Check the chosen model']);
+  assert.equal(explicit.status, 0, explicit.stderr);
+  const explicitState = testFixture.state();
+  assert.equal(explicitState.lastThreadStart.model, model);
+  assert.equal(explicitState.lastTurnStart.model, model);
+  assert.equal(explicitState.lastTurnStart.effort, 'high');
+  assert.match(explicitState.lastTurnStart.prompt, /checks proportional to the change/);
+
+  const delta = 'Check the follow-up condition.';
+  const resumed = testFixture.cli(['task', '--json', '--thread', initialState.lastTurnStart.threadId, delta]);
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.equal(testFixture.state().lastTurnStart.prompt, delta);
+});
 
 test('cancellation closes a private runtime whose initialize RPC never answers', async t => {
   const f = fixture(t, 'initialize-hangs');

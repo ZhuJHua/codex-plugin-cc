@@ -26,7 +26,7 @@ import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable } from "./lib/process.mjs";
-import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import { buildTaskPrompt, loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
   getConfig,
@@ -493,11 +493,11 @@ async function executeTaskRun(request) {
   let frozenApprovalPolicy;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     request.signal?.throwIfAborted();
+    const useTaskTemplate = !attempt && !resumeThreadId && request.prompt && !request.prompt.startsWith(STOP_REVIEW_TASK_MARKER);
     try { result = await runAppServerTurn(workspaceRoot, {
       resumeThreadId,
-      prompt: attempt ? "Continue the interrupted task from this thread. Inspect already applied changes before proceeding; do not repeat completed actions." :
-        request.prompt && !resumeThreadId && !request.prompt.startsWith(STOP_REVIEW_TASK_MARKER)
-          ? interpolateTemplate(loadPromptTemplate(ROOT_DIR, "task").replace(/\r?\n$/, ""), { TASK_REQUEST: request.prompt }) : request.prompt,
+      prompt: attempt ? "Continue the interrupted task from this thread. Inspect already applied changes before proceeding; do not repeat completed actions." : request.prompt,
+      formatPrompt: useTaskTemplate ? (text, resolved) => buildTaskPrompt(ROOT_DIR, text, resolved) : undefined,
       defaultPrompt: DEFAULT_CONTINUE_PROMPT,
       model, effort, modelProvider, sandboxPolicy: frozenSandboxPolicy, approvalPolicy: frozenApprovalPolicy, network: request.network, sandbox: resolveTaskSandbox(request),
       signal: request.signal, onProgress: request.onProgress,
