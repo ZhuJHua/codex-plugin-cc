@@ -338,7 +338,8 @@ rl.on("line", (line) => {
         liveThreadIds.add(thread.id);
         state.lastThreadStart = message.params;
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: thread.sandbox, reasoningEffort: BEHAVIOR === "turn-rpc-rejected" ? "high" : BEHAVIOR === "capacity-rpc-once" ? "medium" : null } });
+        const defaultModel = BEHAVIOR === "gpt-6.2-default" ? "gpt-6.2-astra" : "gpt-5.4";
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || defaultModel, modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: thread.sandbox, reasoningEffort: BEHAVIOR === "turn-rpc-rejected" ? "high" : BEHAVIOR === "capacity-rpc-once" ? "medium" : null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }

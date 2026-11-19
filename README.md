@@ -208,6 +208,8 @@ Task and review commands wait by default. Select `--background` explicitly when 
 
 The `codex-prompting` skill carries version-neutral delegation guidance. A complete request and agreed plan are preserved. Fresh tasks receive a short handoff contract asking for the outcome, changed files, verification results, and remaining blockers; resumed tasks receive only the new instruction. Explicit user output formats take precedence. Models and effort continue to come from your Codex configuration or explicit flags. The legacy `spark` alias is resolved by the runtime.
 
+After Codex resolves the model for a fresh task, the plugin adds guidance for the OpenAI GPT-6 / GPT-6.1 family or the GPT-6.2 family. Other models use the generic handoff contract. See [prompt design and validation](docs/prompting.md) for the two variants.
+
 Adversarial reviews require evidence for material findings and report limitations when inspection is incomplete. The optional stop gate considers only changes attributable to the previous turn; if the runtime has no evidence to attribute edits to that turn, it allows the stop with a limitation instead of treating all dirty files as new changes.
 
 See [prompt design and validation](docs/prompting.md) for official sources, the prompt surfaces, and representative evaluation cases.

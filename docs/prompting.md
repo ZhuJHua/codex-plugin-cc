@@ -1,11 +1,16 @@
 # Prompt design and validation
 
-Reviewed against official OpenAI guidance on 2026-10-27:
+The plugin uses the local Codex harness. Model and reasoning effort are selected through user-supplied flags or Codex configuration and defaults. The plugin formats fresh task prompts after the app server reports the resolved model and provider.
 
-- [GPT-6 prompting best practices](https://developers.openai.com/api/docs/guides/latest-model#prompting-best-practices): keep task scope and completion clear, respect existing authorization, and scale verification to the change. The guidance is a starting point for the GPT-6 family; evaluate it with the actual selected model, including GPT-6.1 Sol.
-- [Rethinking skills and prompts](https://developers.openai.com/blog/rethinking-skills-and-prompts-for-gpt-6-astra): use short, precise skill descriptions, disclose references only when needed, and retire accumulated instructions that no longer help.
+## Task guidance by model family
 
-These are design principles, not a claim that every workload improves. The plugin uses the local Codex harness, so it does not duplicate the harness's full system prompt or prescribe model-specific reasoning rituals. It preserves model configuration and existing compatibility aliases.
+| Resolved model | Fresh task guidance |
+| --- | --- |
+| OpenAI `gpt-6` and `gpt-6.1` variants | Complete authorized work before asking about a blocker, use checks proportional to the change, and give a concise handoff. [GPT-6 / GPT-6.1 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6-astra#prompting-best-practices) |
+| OpenAI `gpt-6.2` variants | Proceed on reasonable, reversible assumptions, check the requested outcome before handing back, reuse repository patterns, and give a self-contained handoff. [GPT-6.2 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6.2-astra#prompting-best-practices) |
+| Other models or providers | Use the generic task contract. |
+
+Resumed turns send only the new instruction or continuation message, leaving earlier turn input intact. The Claude-side delegation skill, adversarial review, and stop gate use shared instructions across models. The review prompts focus on evidence and the output contract for each review. Codex supplies the native reviewer.
 
 ## Prompt surfaces
 
@@ -15,7 +20,7 @@ These are design principles, not a claim that every workload improves. The plugi
 | `agents/codex-rescue.md` | Use the same runner for independent parallel work or context isolation; forward once and relay results or failures. |
 | `skills/codex-cli-runtime` | Translate CLI controls and enforce explicit permission selection. |
 | `skills/codex-prompting` | Clarify incomplete task requests without adding scope or mandatory block templates. |
-| `prompts/task.md` | Add a brief initial task handoff contract; subsequent resumed turns send only the new instruction. |
+| `prompts/task.md` | Provide the common initial handoff contract with guidance selected from the resolved model family. |
 | `prompts/adversarial-review.md` | Challenge changes with evidence and the existing JSON output schema. |
 | `prompts/stop-review-gate.md` | Emit the existing ALLOW/BLOCK protocol for work attributable to the immediately previous turn. |
 | `skills/codex-result-handling` | Preserve output, uncertainty, verification limits, and job references. |
@@ -26,7 +31,7 @@ The command Bash blocks are entry-point templates. Claude substitutes Markdown p
 
 ## Validation
 
-Deterministic tests verify skill references, Claude command transport, preservation of task text, fresh/resumed prompt assembly, review JSON rendering, and the stop-gate protocol. They also cover the separate full-access permission paths. Fixtures do not prove model behavior or a reduction in token usage.
+Deterministic tests verify skill references, Claude command transport, preservation of task text, fresh/resumed prompt assembly, model-family selection from the app-server response, review JSON rendering, and the stop-gate protocol. They also cover the separate full-access permission paths. Fixtures do not prove model behavior or a reduction in token usage.
 
 For a live comparison, keep the same model, effort, repository state, and task input between versions. Use disposable repositories and include these cases:
 
